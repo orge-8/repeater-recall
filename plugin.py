@@ -38,6 +38,9 @@ if _PLUGIN_DIR not in __import__("sys").path:
 # 纯数字 / 纯英文单词不参与复读统计（防误触发，如圆周率数字串、英文打招呼）
 _RE_PURE_NUMBER = re.compile(r"^\d+$")
 _RE_PURE_ASCII_WORD = re.compile(r"^[A-Za-z]{1,4}$")
+# 戳一戳 / 拍一拍系统通知不参与复读统计（真机 2026-09-03：连戳 3 次触发跟读，
+# 复读系统通知 + 该复读又进自评白烧一次 LLM 调用）
+_RE_POKE_NOTICE = re.compile(r"发起了戳一戳|戳一戳|拍了拍")
 
 # LLM 自评提示词（无上下文降级版）：固定判断，仅返回 JSON。
 # 待审消息用明确分隔符包裹，防止消息文本中的内容被当作指令（提示注入防护）。
@@ -100,6 +103,11 @@ class RepeatSectionConfig(PluginConfigBase):
     cooldown_seconds: int = Field(default=300, ge=0, le=3600, description="跟读后冷却秒数，防止连环复读")
     min_length: int = Field(default=2, ge=1, le=20, description="参与统计的最短文本长度")
     ignore_case: bool = Field(default=True, description="比较时忽略大小写")
+    require_distinct_users: bool = Field(
+        default=True,
+        description="是否要求接龙的都是不同用户：开启后同一个人连刷同一句不触发跟读，"
+        "必须连续 N 条来自 N 个不同用户才跟读；关闭则退化为旧行为（只看文本连续重复）",
+    )
 
 
 class RecallSectionConfig(PluginConfigBase):
@@ -272,17 +280,49 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             return False
         if _RE_PURE_ASCII_WORD.match(text):
             return False
+        if _RE_POKE_NOTICE.search(text):
+            return False
         return True
 
-    def _check_repeat(self, stream_id: str, text_norm: str) -> bool:
-        """更新连续计数，达到阈值且不在冷却期时返回 True。"""
+    @staticmethod
+    def _extract_sender_id(message: dict) -> str:
+        """提取入站消息发送者 user_id，兼容多层载荷形态；取不到返回空串。"""
+        if not isinstance(message, dict):
+            return ""
+        for key in ("user_id", "sender_id", "sender_user_id"):
+            val = message.get(key)
+            if val not in (None, ""):
+                return str(val)
+        info = message.get("message_info") or {}
+        if not isinstance(info, dict):
+            return ""
+        for key in ("user_info", "user", "sender"):
+            node = info.get(key)
+            if isinstance(node, dict):
+                uid = node.get("user_id") or node.get("id")
+                if uid not in (None, ""):
+                    return str(uid)
+        return ""
+
+    def _check_repeat(self, stream_id: str, text_norm: str, sender_id: str) -> bool:
+        """更新连续计数，达到阈值且不在冷却期时返回 True。
+
+        接龙语义（require_distinct_users）：连续 N 条相同文本必须来自 N 个**不同**用户；
+        同一用户在链条里重复出现（自己连刷）→ 链条作废重新计数。
+        拿不到发送者 ID 时按「不同用户」处理（每条分配唯一占位 ID），
+        宁可保留旧行为误跟读，也不因解析不到 ID 让复读机彻底哑火。
+        """
         threshold = self.config.repeat.threshold
         bucket = self._recent.setdefault(stream_id, deque(maxlen=threshold))
         if bucket and bucket[-1][0] == text_norm:
-            bucket.append((text_norm, time.time()))
+            if self.config.repeat.require_distinct_users and any(
+                entry[2] == sender_id for entry in bucket
+            ):
+                bucket.clear()  # 同一用户重复参与 → 不是接龙，作废重来
+            bucket.append((text_norm, time.time(), sender_id))
         else:
             bucket.clear()
-            bucket.append((text_norm, time.time()))
+            bucket.append((text_norm, time.time(), sender_id))
         if len(bucket) < threshold:
             return False
         if time.time() < self._cooldown_until.get(stream_id, 0.0):
@@ -592,7 +632,12 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         normalized = self._normalize_text(text, cfg.ignore_case)
         if not self._should_count(normalized, cfg.min_length):
             return {"action": "continue"}
-        if not self._check_repeat(stream_id, normalized):
+        sender_id = self._extract_sender_id(message)
+        if not sender_id:
+            # 解析不到发送者：给每条消息分配唯一占位 ID，按「不同用户」处理
+            self._unknown_sender_seq = getattr(self, "_unknown_sender_seq", 0) + 1
+            sender_id = f"__unknown_{self._unknown_sender_seq}"
+        if not self._check_repeat(stream_id, normalized, sender_id):
             return {"action": "continue"}
         self._mark_cooldown(stream_id)
         self._spawn(self._repeat_send(stream_id, text))
