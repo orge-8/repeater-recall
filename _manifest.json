@@ -1,0 +1,39 @@
+{
+    "manifest_version": 2,
+    "id": "org.mai-mai.repeater-recall",
+    "version": "1.0.4",
+    "name": "复读机与自主撤回",
+    "description": "经典复读机（连续相同消息跟读）+ LLM 自主撤回（出站消息全量记录 + 发送后自评撤回 + LLM 工具手动撤回 + 历史兜底）。/recall 撤回命令仅管理员可用。撤回功能依赖 napcat-adapter 适配器。",
+    "author": {
+        "name": "orge-8",
+        "url": "https://github.com/orge-8"
+    },
+    "license": "MIT",
+    "urls": {
+        "repository": "https://github.com/orge-8/repeater-recall"
+    },
+    "host_application": {
+        "min_version": "1.2.0",
+        "max_version": "1.99.99"
+    },
+    "sdk": {
+        "min_version": "2.5.0",
+        "max_version": "2.99.99"
+    },
+    "dependencies": [
+        {
+            "type": "plugin",
+            "id": "maibot-team.napcat-adapter",
+            "version_spec": ">=1.4.0"
+        }
+    ],
+    "capabilities": [
+        "send.text",
+        "llm.generate",
+        "message.get_recent",
+        "api.call"
+    ],
+    "i18n": {
+        "default_locale": "zh-CN"
+    }
+}
