@@ -70,21 +70,36 @@ MaiBot 插件：经典复读机 + LLM 自主撤回。
 |---|---|
 | `/recall` 或 `/撤回` | **管理员专用**：手动撤回 bot 最近一条消息。触发者须在 `recall.admin_ids` 中，或来自本地控制台 |
 
+## 安全边界
+
+- `/recall` 与 `/撤回` 仅 `recall.admin_ids` 内成员或本地控制台（bot_console）可用；
+  `admin_ids` 为空时远程一律拒绝。LLM 工具与自评撤回不走该鉴权（设计如此）。
+- 自评提示词用 `<<<MSG>>>` / `<<<END>>>` 分隔待审文本，注入前会把文本里的连续尖括号中和，
+  防止群友用伪造分隔符闭合段落、注入指令。
+- `max_recalls_per_hour` 对自评 / LLM 工具 / 命令三条撤回路径统一生效。
+- 自评 LLM 调用有 30 秒超时，失败/超时连续 3 次熔断 10 分钟，避免刷屏与后台任务堆积。
+
 ## 测试方式（本地，无需真机）
 
 ```bash
 # 在 MaiBot插件开发/ 目录下
-.venv/Scripts/python.exe check_plugin.py plugins/repeater-recall   # 结构自检
-.venv/Scripts/python.exe smoke_test.py plugins/repeater-recall     # 生命周期冒烟
-.venv/Scripts/python.exe test_repeater_recall.py                   # 功能直调测试（72 项）
-.venv/Scripts/python.exe run_gates.py plugins/repeater-recall      # check + smoke 双门禁
+.venv/Scripts/python.exe check_plugin.py plugins/repeater-recall          # 结构自检
+.venv/Scripts/python.exe smoke_test.py plugins/repeater-recall            # 生命周期冒烟
+.venv/Scripts/python.exe test_repeater_recall.py                          # 功能直调测试（100 项）
+.venv/Scripts/python.exe test_repeater_recall_extra.py                    # 上线前增量 QA（30 项）
+.venv/Scripts/python.exe run_gates.py plugins/repeater-recall             # check + smoke 双门禁
 ```
 
-测试覆盖：装饰器-函数配对、复读触发/冷却/分流、过滤规则、撤回四态（成功/失败/适配器缺失/超时）、
+基础套件覆盖：装饰器-函数配对、复读触发/冷却/分流、过滤规则、撤回四态（成功/失败/适配器缺失/超时）、
 配额、自评三态（该撤/不撤/垃圾响应）、命令鉴权五种身份、**after_send 记录五态**（主链路含负数
 message_id / sent=False / 缺 ID / 非 bot / 登录信息不可用降级）、**历史兜底六态**（命中/无 bot 消息/
 过期/缺时间戳/内存优先/接口故障静默）、**manifest 能力声明 + 退避熔断九态**（失败退避/退避期内不重试/
 退避过期恢复/成功后缓存/自评熔断/熔断不误伤撤回/review_model 透传/默认空串/成功后清零）。
+
+增量 QA 覆盖：on_unload 在途任务回收、惰性清理四态（统计/冷却/消息记录/上下文缓存）、
+**提示注入分隔符中和**、配额滑动窗口过期、**通用入口软失败降级强类型入口**、
+**自评 LLM 超时保护**（Host RPC 无内建超时，卡住会让自评任务永久挂起）、
+平台消息 ID 两种键形态、自评撤回不误删更新的记录、静态扫描（无硬编码绝对路径/QQ 号/密钥）。
 
 ## 常见问题
 
@@ -101,6 +116,11 @@ message_id / sent=False / 缺 ID / 非 bot / 登录信息不可用降级）、**
   2. 把插件配置 `recall.review_model` 填成具体模型名（绕过任务路由，改完热重载即可）；
   3. 把 `recall.self_review` 设为 `false` 彻底关闭自评。
   自评连续失败 3 次会自动熔断 10 分钟并停止刷屏，**撤回工具与 `/recall` 命令不受自评影响**。
+  v1.0.9 起自评 LLM 调用带 30 秒超时（Host 的 RPC 没有内建超时），超时按失败计入熔断，
+  不会让自评任务永久挂在后台——只有插件卸载才能回收的旧行为已修掉。
+- **自评 LLM 调用量没有上限**：bot 每发一条消息就触发一次自评（含被切成多段的分段回复），
+  即使一次都不撤回也照样消耗 token。`max_recalls_per_hour` 只限制「撤回次数」，不限制「自评次数」。
+  高频群建议调大 `review_delay_seconds` 或把 `context_messages` 设为 0 缩短 prompt。
 - **一次回复被切成多段，撤回只撤掉最后一段**：这是 MaiBot 的智能分段机制，每段都是独立消息、
   各有自己的 `message_id`。插件只保留最近一条，需要全撤就连续调用几次撤回。
 - **撤回报"适配器不可用"**：检查 napcat-adapter 是否加载、NapCat 是否在线；`ctx.api.call` 报「API 不存在」通常是适配器未装或版本 < 1.4.0。

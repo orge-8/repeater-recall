@@ -17,7 +17,6 @@ import json
 import re
 import time
 from collections import deque
-from pathlib import Path
 from typing import Any
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
@@ -29,18 +28,25 @@ try:  # pragma: no cover - 版本兼容分支
 except AttributeError:  # pragma: no cover
     _HOOK_MODE_OBSERVE = "observe"
 
-_PLUGIN_DIR = str(Path(__file__).resolve().parent)
-if _PLUGIN_DIR not in __import__("sys").path:
-    import sys
-
-    sys.path.insert(0, _PLUGIN_DIR)
-
 # 纯数字 / 纯英文单词不参与复读统计（防误触发，如圆周率数字串、英文打招呼）
 _RE_PURE_NUMBER = re.compile(r"^\d+$")
 _RE_PURE_ASCII_WORD = re.compile(r"^[A-Za-z]{1,4}$")
 # 戳一戳 / 拍一拍系统通知不参与复读统计（真机 2026-09-03：连戳 3 次触发跟读，
 # 复读系统通知 + 该复读又进自评白烧一次 LLM 调用）
 _RE_POKE_NOTICE = re.compile(r"发起了戳一戳|戳一戳|拍了拍")
+
+# 提示注入防护：待审文本 / 上下文文本里若出现 <<<、>>>，可闭合 <<<MSG>>>/<<<END>>> 分隔符
+# 并在其后伪造指令段。注入提示词前先把连续尖括号替换成视觉等价的单书名号，破坏分隔符匹配。
+_RE_LT_RUN = re.compile(r"<{2,}")
+_RE_GT_RUN = re.compile(r">{2,}")
+
+
+def _neutralize_delimiters(text: str) -> str:
+    """中和文本中的分隔符形态（<<</>>>），防止提示注入突破提示词边界。"""
+    if not text:
+        return ""
+    out = _RE_LT_RUN.sub(lambda m: "‹" * len(m.group(0)), text)
+    return _RE_GT_RUN.sub(lambda m: "›" * len(m.group(0)), out)
 
 # LLM 自评提示词（无上下文降级版）：固定判断，仅返回 JSON。
 # 待审消息用明确分隔符包裹，防止消息文本中的内容被当作指令（提示注入防护）。
@@ -78,6 +84,15 @@ _RECALL_EXPIRE_SECONDS = 120  # 超过 2 分钟的 bot 消息不再撤回（QQ �
 _BOT_IDS_RETRY_SECONDS = 300  # get_login_info 失败后 5 分钟内不再重试（能力未授权时否则每来一条消息刷一条告警）
 _REVIEW_FAIL_STREAK = 3  # 自评 LLM 连续失败几次后熔断
 _REVIEW_PAUSE_SECONDS = 600  # 熔断后暂停自评 10 分钟
+_REVIEW_LLM_TIMEOUT_SECONDS = 30  # 单次自评 LLM 调用超时（秒）：Host 侧 RPC 无内建超时，
+# 卡住会让自评任务永久挂在 _tasks 里，只能等卸载才回收，故在此显式加超时并计入失败熔断。
+
+# 内存与性能控制（硬编码，不暴露为配置项）
+_STREAM_IDLE_SECONDS = 3600  # 沉默流的复读统计/冷却状态保留时长
+_LAST_BOT_MSG_TTL = 3600  # bot 出站消息记录保留时长（远大于撤回时限 120s，保留「已超时」提示语义）
+_PRUNE_INTERVAL = 300  # 惰性清理节流：最多每 5 分钟扫一次
+_CTX_CACHE_TTL = 15  # 自评上下文缓存秒数（覆盖分段回复的连续自评）
+_TEXT_KEEP = 500  # 消息文本截断存储长度（对齐自评 prompt 的截断上限）
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -139,7 +154,7 @@ class RecallSectionConfig(PluginConfigBase):
     max_recalls_per_hour: int = Field(default=6, ge=1, le=60, description="每小时撤回总次数上限（含自评/工具/手动命令）")
     admin_ids: list[str] = Field(
         default_factory=list,
-        description="可使用 /recall 撤回命令的管理员 QQ 列表（兼容 qq:123456789 格式）；为空时仅本地控制台可用",
+        description="可使用 /recall 撤回命令的管理员 QQ 列表（兼容 qq: 前缀，如 qq:你的QQ号）；为空时仅本地控制台可用",
     )
 
 
@@ -171,6 +186,9 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         self._bot_ids_checked_at: float = 0.0  # 上次尝试 get_login_info 的时刻（失败也记，用于退避）
         self._review_fail_streak: int = 0  # 自评 LLM 连续失败次数
         self._review_paused_until: float = 0.0  # 自评熔断截止时间
+        self._ctx_cache: dict[str, tuple[float, str]] = {}  # 自评上下文缓存：stream_id -> (拉取时刻, 格式化文本)
+        self._last_prune_at: float = 0.0  # 上次惰性清理时刻（按 _PRUNE_INTERVAL 节流）
+        self._unknown_sender_seq: int = 0  # 解析不到发送者时的占位 ID 序号
         cfg = self.config
         self.ctx.logger.info(
             "复读机与自主撤回已加载（复读=%s 阈值=%s 冷却=%ss；撤回=%s 自评=%s）",
@@ -216,6 +234,34 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         task = asyncio.get_running_loop().create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    def _maybe_prune(self) -> None:
+        """节流入口：距上次清理超过 _PRUNE_INTERVAL 才执行一次清扫。"""
+        now = time.time()
+        if now - self._last_prune_at >= _PRUNE_INTERVAL:
+            self._prune_stream_state(now)
+
+    def _prune_stream_state(self, now: float) -> None:
+        """惰性清理各 per-stream 状态，防止死群/沉默流状态无界累积。
+
+        挂在消息处理热点上节流调用（_maybe_prune），不引入常驻定时任务。
+        """
+        self._last_prune_at = now
+        for sid, until in list(self._cooldown_until.items()):
+            if until < now:
+                del self._cooldown_until[sid]
+        idle_before = now - _STREAM_IDLE_SECONDS
+        for sid, bucket in list(self._recent.items()):
+            if not bucket or bucket[-1][1] < idle_before:
+                del self._recent[sid]
+        msg_before = now - _LAST_BOT_MSG_TTL
+        for sid, entry in list(self._last_bot_msg.items()):
+            if entry.get("ts", 0.0) < msg_before:
+                del self._last_bot_msg[sid]
+        ctx_before = now - _CTX_CACHE_TTL
+        for sid, (fetched_at, _ctx) in list(self._ctx_cache.items()):
+            if fetched_at < ctx_before:
+                del self._ctx_cache[sid]
 
     async def _ensure_bot_ids(self) -> set:
         """获取并缓存 bot 自身 user_id（get_login_info，陷阱篇：不要反查历史消息取机器人昵称）。
@@ -311,18 +357,22 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         同一用户在链条里重复出现（自己连刷）→ 链条作废重新计数。
         拿不到发送者 ID 时按「不同用户」处理（每条分配唯一占位 ID），
         宁可保留旧行为误跟读，也不因解析不到 ID 让复读机彻底哑火。
+
+        bucket 存文本哈希而非全文（64 位 SipHash，碰撞概率约 2^-64，最坏后果是多触发
+        一次有冷却兜底的复读），避免长文本复读场景内存被 threshold 倍放大。
         """
         threshold = self.config.repeat.threshold
+        text_key = hash(text_norm)
         bucket = self._recent.setdefault(stream_id, deque(maxlen=threshold))
-        if bucket and bucket[-1][0] == text_norm:
+        if bucket and bucket[-1][0] == text_key:
             if self.config.repeat.require_distinct_users and any(
                 entry[2] == sender_id for entry in bucket
             ):
                 bucket.clear()  # 同一用户重复参与 → 不是接龙，作废重来
-            bucket.append((text_norm, time.time(), sender_id))
+            bucket.append((text_key, time.time(), sender_id))
         else:
             bucket.clear()
-            bucket.append((text_norm, time.time(), sender_id))
+            bucket.append((text_key, time.time(), sender_id))
         if len(bucket) < threshold:
             return False
         if time.time() < self._cooldown_until.get(stream_id, 0.0):
@@ -354,18 +404,24 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             mid = int(message_id)
         except (TypeError, ValueError):
             mid = message_id  # 非数字形态原样透传
+        first_error = ""
+        resp: Any = None
         try:
             resp = await self.ctx.api.call(
                 "adapter.napcat.action.call", action_name="delete_msg", params={"message_id": mid}
             )
         except Exception as first_exc:
+            first_error = first_exc.__class__.__name__
+        if resp is None or (isinstance(resp, dict) and resp.get("success") is False):
+            # 通用入口抛异常或软失败（如适配器未注册该 action 返回「API 不存在」）→ 降级强类型入口
+            if not first_error:
+                first_error = str((resp or {}).get("error") or "适配器执行失败")
             try:
                 resp = await self.ctx.api.call("adapter.napcat.message.delete_msg", message_id=mid)
             except Exception as second_exc:
-                return False, f"撤回失败：napcat 适配器不可用（{first_exc.__class__.__name__} / {second_exc.__class__.__name__}）"
+                return False, f"撤回失败：napcat 适配器不可用（{first_error} / {second_exc.__class__.__name__}）"
         if isinstance(resp, dict) and resp.get("success") is False:
-            reason = resp.get("error") or "适配器执行失败"
-            return False, f"撤回失败：{reason}"
+            return False, f"撤回失败：{first_error}"
         return True, "已撤回"
 
     def _on_review_failure(self, result: Any) -> None:
@@ -395,10 +451,17 @@ class RepeaterRecallPlugin(MaiBotPlugin):
 
         - 排除待审消息本身（按 platform_message_id 匹配），避免同一条出现两次；
         - bot 自己的历史发言标注 [bot]，便于 LLM 区分角色；
-        - 任何异常都静默降级，返回空串走纯文本判定（不阻塞撤回链路）。
+        - 任何异常都静默降级，返回空串走纯文本判定（不阻塞撤回链路）；
+        - 按 stream_id 做 _CTX_CACHE_TTL 秒短缓存：分段回复的 N 个分段各自触发自评，
+          延迟数秒后拉到的上下文近乎相同，缓存可把一波分段的 RPC 从 N 次降到 1 次
+          （复用他人缓存时待审消息可能出现在上下文里，仅属冗余，prompt 的 <<<MSG>>>
+          段已明确待审对象，不影响判定）。
         """
         if limit <= 0:
             return ""
+        cached = self._ctx_cache.get(stream_id)
+        if cached and time.time() - cached[0] < _CTX_CACHE_TTL:
+            return cached[1]
         try:
             bot_ids = await self._ensure_bot_ids()
             result = await self.ctx.message.get_recent(stream_id, limit=limit + 5)
@@ -422,8 +485,11 @@ class RepeaterRecallPlugin(MaiBotPlugin):
                     bool(uid) and uid in bot_ids
                 )
                 prefix = "[bot] " if is_bot else ""
-                lines.append(f"{prefix}{text[:200]}")
-            return "\n".join(lines[-limit:]) if lines else ""
+                lines.append(f"{prefix}{_neutralize_delimiters(text[:200])}")
+            context = "\n".join(lines[-limit:]) if lines else ""
+            if context:
+                self._ctx_cache[stream_id] = (time.time(), context)
+            return context
         except Exception as exc:
             # 上下文是加分项不是必需项：失败降级为纯文本判定
             self.ctx.logger.debug("自评上下文获取失败，降级为纯文本判定：%s", exc)
@@ -439,14 +505,23 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             context = await self._fetch_review_context(
                 stream_id, message_id, self.config.recall.context_messages
             )
+            safe_text = _neutralize_delimiters(text[:500])
             if context:
-                prompt = _SELF_REVIEW_CTX_PROMPT.format(context=context, text=text[:500])
+                prompt = _SELF_REVIEW_CTX_PROMPT.format(context=context, text=safe_text)
             else:
-                prompt = _SELF_REVIEW_PROMPT.format(text=text[:500])
+                prompt = _SELF_REVIEW_PROMPT.format(text=safe_text)
             try:
-                result = await self.ctx.llm.generate(
-                    prompt=prompt, model=self.config.recall.review_model or ""
+                result = await asyncio.wait_for(
+                    self.ctx.llm.generate(
+                        prompt=prompt, model=self.config.recall.review_model or ""
+                    ),
+                    timeout=_REVIEW_LLM_TIMEOUT_SECONDS,
                 )
+            except (asyncio.TimeoutError, TimeoutError):
+                result = {
+                    "success": False,
+                    "error": f"自评 LLM 调用超时（超过 {_REVIEW_LLM_TIMEOUT_SECONDS} 秒）",
+                }
             except Exception as exc:
                 result = {"success": False, "error": f"{exc.__class__.__name__}: {exc}"}
             if not isinstance(result, dict) or not result.get("success"):
@@ -488,12 +563,15 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         仅记录，不触发自评：自评统一由 handle_after_send 触发（对所有出站消息
         必达），避免插件自己发送的消息在 _send_and_track 与主链路 after_send
         两处各 spawn 一次自评（双倍 LLM 调用 + 双倍配额 + 并发撤回竞争）。
+
+        文本截断到 _TEXT_KEEP 存储：自评 prompt 只用前 500 字符，日志用 %.30s/%.50s，
+        全文驻留没有收益。
         """
         if message_id is None:
             return
         self._last_bot_msg[stream_id] = {
             "message_id": message_id,
-            "text": text,
+            "text": text[:_TEXT_KEEP],
             "ts": time.time(),
         }
 
@@ -512,7 +590,7 @@ class RepeaterRecallPlugin(MaiBotPlugin):
 
     @staticmethod
     def _normalize_admin_id(entry: str) -> str:
-        """管理员条目归一化：兼容 ["123456789"] 与 ["qq:123456789"]，取 ID 部分比较。"""
+        """管理员条目归一化：兼容纯 QQ 号与 qq:<QQ号> 前缀两种写法，取 ID 部分比较。"""
         s = str(entry or "").strip()
         if ":" in s:
             s = s.split(":", 1)[1].strip()
@@ -522,7 +600,7 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         """命令管理员鉴权（插件自管）。
 
         本地控制台操作员天然放行；否则触发者 user_id 须在配置的
-        admin_ids 列表中（兼容 qq:123456789 格式，忽略大小写）。
+        admin_ids 列表中（兼容 qq:<QQ号> 前缀，忽略大小写）。
         """
         if bool(kwargs.get("is_local_operator")):
             return True
@@ -618,6 +696,8 @@ class RepeaterRecallPlugin(MaiBotPlugin):
     async def handle_repeat_check(self, message: dict | None = None, **kwargs) -> dict:
         """入站消息复读统计（OBSERVE，不拦截不改写）。"""
         del kwargs
+        # 清理入口放在开关判断之前：关闭复读后残留的统计/冷却状态也要能被回收
+        self._maybe_prune()
         if not self.config.plugin.enabled or not self.config.repeat.enabled:
             return {"action": "continue"}
         if not isinstance(message, dict):
@@ -635,7 +715,7 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         sender_id = self._extract_sender_id(message)
         if not sender_id:
             # 解析不到发送者：给每条消息分配唯一占位 ID，按「不同用户」处理
-            self._unknown_sender_seq = getattr(self, "_unknown_sender_seq", 0) + 1
+            self._unknown_sender_seq += 1
             sender_id = f"__unknown_{self._unknown_sender_seq}"
         if not self._check_repeat(stream_id, normalized, sender_id):
             return {"action": "continue"}
@@ -651,15 +731,23 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         发送成功后 SessionMessage 会回填 platform_message_id（平台消息 ID，可撤回）。
         """
         del kwargs
+        self._maybe_prune()
         if not self.config.plugin.enabled or not self.config.recall.enabled:
             return {"action": "continue"}
         if not sent or not isinstance(message, dict):
             return {"action": "continue"}
-        if not self._outgoing_is_from_bot(message, await self._ensure_bot_ids()):
+        # 快路径：additional_config.self_id 已能证明 bot 身份时，无需取登录信息缓存
+        cfg_node = message.get("additional_config")
+        if isinstance(cfg_node, dict) and cfg_node.get("self_id"):
+            is_bot = True
+        else:
+            is_bot = self._outgoing_is_from_bot(message, await self._ensure_bot_ids())
+        if not is_bot:
             return {"action": "continue"}
         stream_id = str(message.get("session_id") or message.get("stream_id") or "")
         mid = self._extract_platform_message_id(message)
-        text = str(message.get("processed_plain_text") or "")
+        # 截断存储：自评 prompt 只用前 _TEXT_KEEP 字符，日志用 %.30s，全文驻留没有收益
+        text = str(message.get("processed_plain_text") or "")[:_TEXT_KEEP]
         if not stream_id or mid in (None, ""):
             # 首次未取到 ID 时记一条诊断，便于真机确认载荷结构
             self.ctx.logger.warning(
@@ -673,7 +761,8 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             "ts": time.time(),
         }
         self.ctx.logger.info("已记录 bot 出站消息（stream=%s id=%s）：%.30s", stream_id, mid, text)
-        if self.config.recall.self_review:
+        # 熔断期内不创建空转自评任务（任务内 sleep 后的熔断检查仍保留，覆盖 spawn 后才熔断的情况）
+        if self.config.recall.self_review and time.time() >= self._review_paused_until:
             self._spawn(self._self_review(stream_id, mid, text))
         return {"action": "continue"}
 

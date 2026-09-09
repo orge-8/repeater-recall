@@ -1,7 +1,7 @@
 {
     "manifest_version": 2,
     "id": "org.mai-mai.repeater-recall",
-    "version": "1.0.7",
+    "version": "1.0.9",
     "name": "复读机与自主撤回",
     "description": "经典复读机（连续相同消息且来自不同用户才跟读）+ LLM 自主撤回（出站消息全量记录 + 语境感知自评撤回 + LLM 工具手动撤回 + 历史兜底）。/recall 撤回命令仅管理员可用。撤回功能依赖 napcat-adapter 适配器。",
     "author": {
