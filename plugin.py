@@ -35,6 +35,8 @@ _RE_PURE_ASCII_WORD = re.compile(r"^[A-Za-z]{1,4}$")
 # 复读系统通知 + 该复读又进自评白烧一次 LLM 调用）
 _RE_POKE_NOTICE = re.compile(r"发起了戳一戳|戳一戳|拍了拍")
 
+# 纯占位文本（如 [voiceurl消息]/[图片]/[文件]）没有可判定的语义，自评纯浪费一次 LLM 调用
+_RE_PLACEHOLDER_ONLY = re.compile(r"^\[[^\[\]]{1,24}\]$")
 # 提示注入防护：待审文本 / 上下文文本里若出现 <<<、>>>，可闭合 <<<MSG>>>/<<<END>>> 分隔符
 # 并在其后伪造指令段。注入提示词前先把连续尖括号替换成视觉等价的单书名号，破坏分隔符匹配。
 _RE_LT_RUN = re.compile(r"<{2,}")
@@ -84,8 +86,9 @@ _RECALL_EXPIRE_SECONDS = 120  # 超过 2 分钟的 bot 消息不再撤回（QQ �
 _BOT_IDS_RETRY_SECONDS = 300  # get_login_info 失败后 5 分钟内不再重试（能力未授权时否则每来一条消息刷一条告警）
 _REVIEW_FAIL_STREAK = 3  # 自评 LLM 连续失败几次后熔断
 _REVIEW_PAUSE_SECONDS = 600  # 熔断后暂停自评 10 分钟
-_REVIEW_LLM_TIMEOUT_SECONDS = 30  # 单次自评 LLM 调用超时（秒）：Host 侧 RPC 无内建超时，
-# 卡住会让自评任务永久挂在 _tasks 里，只能等卸载才回收，故在此显式加超时并计入失败熔断。
+# 自评 LLM 调用超时改为可配置（recall.review_timeout_seconds，默认 60s）：
+# Host 侧 RPC 无内建超时，插件侧超时只是放弃等待，Host 仍会把请求跑完并计费；
+# 自评模型较慢（如 LongCat-2.0 平均 24s、p95 >50s）时 30s 超时必然白烧 token + 计入熔断。
 
 # 内存与性能控制（硬编码，不暴露为配置项）
 _STREAM_IDLE_SECONDS = 3600  # 沉默流的复读统计/冷却状态保留时长
@@ -140,6 +143,15 @@ class RecallSectionConfig(PluginConfigBase):
         description=(
             "自评用的模型名；留空则用 Host 默认。若日志报「任务 plugin.<插件ID> 的模型 <xxx-embedding> 参数不正确」，"
             "说明 Host 没给本插件配文本生成模型，把这里填成具体模型名（如 utils / replyer 用的模型）即可绕过"
+        ),
+    )
+    review_timeout_seconds: int = Field(
+        default=60,
+        ge=5,
+        le=300,
+        description=(
+            "单次自评 LLM 调用超时秒数。插件侧超时只是放弃等待，Host 仍会把请求跑完并计费，"
+            "自评模型较慢（平均耗时 >20s）时建议调大，避免反复超时触发熔断"
         ),
     )
     context_messages: int = Field(
@@ -510,17 +522,18 @@ class RepeaterRecallPlugin(MaiBotPlugin):
                 prompt = _SELF_REVIEW_CTX_PROMPT.format(context=context, text=safe_text)
             else:
                 prompt = _SELF_REVIEW_PROMPT.format(text=safe_text)
+            timeout_seconds = max(5, int(self.config.recall.review_timeout_seconds))
             try:
                 result = await asyncio.wait_for(
                     self.ctx.llm.generate(
                         prompt=prompt, model=self.config.recall.review_model or ""
                     ),
-                    timeout=_REVIEW_LLM_TIMEOUT_SECONDS,
+                    timeout=timeout_seconds,
                 )
             except (asyncio.TimeoutError, TimeoutError):
                 result = {
                     "success": False,
-                    "error": f"自评 LLM 调用超时（超过 {_REVIEW_LLM_TIMEOUT_SECONDS} 秒）",
+                    "error": f"自评 LLM 调用超时（超过 {timeout_seconds} 秒）",
                 }
             except Exception as exc:
                 result = {"success": False, "error": f"{exc.__class__.__name__}: {exc}"}
@@ -761,6 +774,10 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             "ts": time.time(),
         }
         self.ctx.logger.info("已记录 bot 出站消息（stream=%s id=%s）：%.30s", stream_id, mid, text)
+        # 纯占位文本（语音/图片/文件等无语义载荷）没有可判定内容，跳过自评省一次 LLM 调用
+        if _RE_PLACEHOLDER_ONLY.match(text.strip()):
+            self.ctx.logger.info("出站消息为纯占位文本，跳过自评（stream=%s）：%.30s", stream_id, text)
+            return {"action": "continue"}
         # 熔断期内不创建空转自评任务（任务内 sleep 后的熔断检查仍保留，覆盖 spawn 后才熔断的情况）
         if self.config.recall.self_review and time.time() >= self._review_paused_until:
             self._spawn(self._self_review(stream_id, mid, text))
