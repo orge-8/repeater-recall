@@ -9,6 +9,11 @@ MaiBot 插件：经典复读机 + LLM 自主撤回。
 3. **发送后自评撤回**：bot 每条消息（含复读与主链路回复）发出后延迟数秒，由 LLM 自评是否明显不合适（易引战 / 严重答非所问 / 可能违规）。自评默认携带最近 10 条聊天记录做语境判断——接梗、玩谐音、延续当前话题不算跑题，避免「单看像跑题实际是正常回复」的误撤。判定"该撤"则自动通过 NapCat 撤回。每小时有撤回配额上限兜底防误撤。
 4. **LLM 撤回工具**：注册 `recall_last_message` 工具，LLM 在对话中发现自己的回复不合适时可主动调用撤回。
 5. **手动撤回命令（管理员专用）**：`/recall` 或 `/撤回` 撤回 bot 最近一条消息（2 分钟时限内）。触发者须在 `recall.admin_ids` 管理员列表中，本地控制台（bot_console）不受限制。
+6. **分段感知（v1.2.0 新增）**：与智能分段插件（如 [smart_segmentation_plugin](https://github.com/saberlights/smart_segmentation_plugin)）共存时，一条回复被拆成多条连续消息发送——聚合窗口（`recall.group_window_seconds`，默认 6 秒）内的出站消息合并为一条逻辑回复：
+   - **自评按合并后完整文本判定一次**（N 段只烧 1 次 LLM 调用，不再逐段评审）；
+   - **`/recall` 与 LLM 撤回工具一次撤回该回复的全部段**（共享一次撤回配额）；
+   - 组内超 2 分钟（QQ 撤回时限）的段自动剔除，剩余段照常可撤；
+   - 复读跟读不受影响：分段插件只处理主回复链路的产出，不会切分插件自己发送的消息。
 
 ### 撤回目标的两级定位
 
@@ -64,6 +69,7 @@ MaiBot 插件：经典复读机 + LLM 自主撤回。
 | context_messages | 10 | 自评时带入的近期聊天记录条数，用于语境判断（接梗/玩谐音/回应点名不算跑题）；0 = 关闭语境感知，仅凭消息本身判断。历史接口异常时自动降级为纯文本判定，不影响撤回链路（0–50） |
 | max_recalls_per_hour | 6 | 每小时撤回总次数上限（含自评/工具/手动命令）（1–60） |
 | admin_ids | [] | 可用 `/recall`/`/撤回` 命令的管理员 QQ 列表，兼容 `["qq:123456789"]` 格式；为空时仅本地控制台（bot_console）可用。LLM 工具与自评撤回不受此列表限制 |
+| group_window_seconds | 6.0 | 分段聚合窗口（0.5–30 秒）：与智能分段插件共存时，间隔小于该窗口的出站消息合并为一条逻辑回复（整组撤回 + 聚合自评一次）。需大于分段插件的补发间隔（宿主 `response_post_process.typing_speed` 越大间隔越长）；不用分段插件时保持默认即可 |
 
 ## 命令
 
@@ -89,6 +95,7 @@ MaiBot 插件：经典复读机 + LLM 自主撤回。
 .venv/Scripts/python.exe smoke_test.py plugins/repeater-recall            # 生命周期冒烟
 .venv/Scripts/python.exe test_repeater_recall.py                          # 功能直调测试（100 项）
 .venv/Scripts/python.exe test_repeater_recall_extra.py                    # 上线前增量 QA（30 项）
+.venv/Scripts/python.exe test_repeater_recall_seg.py                      # 分段感知专项（21 项，v1.2.0）
 .venv/Scripts/python.exe run_gates.py plugins/repeater-recall             # check + smoke 双门禁
 ```
 
@@ -118,13 +125,21 @@ message_id / sent=False / 缺 ID / 非 bot / 登录信息不可用降级）、**
   2. 把插件配置 `recall.review_model` 填成具体模型名（绕过任务路由，改完热重载即可）；
   3. 把 `recall.self_review` 设为 `false` 彻底关闭自评。
   自评连续失败 3 次会自动熔断 10 分钟并停止刷屏，**撤回工具与 `/recall` 命令不受自评影响**。
-  v1.0.9 起自评 LLM 调用带 30 秒超时（Host 的 RPC 没有内建超时），超时按失败计入熔断，
+  v1.0.9 起自评 LLM 调用带超时保护（现由 `review_timeout_seconds` 配置，默认 60 秒），超时按失败计入熔断，
   不会让自评任务永久挂在后台——只有插件卸载才能回收的旧行为已修掉。
-- **自评 LLM 调用量没有上限**：bot 每发一条消息就触发一次自评（含被切成多段的分段回复），
-  即使一次都不撤回也照样消耗 token。`max_recalls_per_hour` 只限制「撤回次数」，不限制「自评次数」。
+- **自评 LLM 调用量没有上限**：bot 每条逻辑回复触发一次自评（v1.2.0 起分段回复聚合为一条逻辑回复，
+  N 段只调 1 次 LLM；v1.2.0 之前逐段各调一次）。即使一次都不撤回也照样消耗 token。
+  `max_recalls_per_hour` 只限制「撤回次数」，不限制「自评次数」。
   高频群建议调大 `review_delay_seconds` 或把 `context_messages` 设为 0 缩短 prompt。
-- **一次回复被切成多段，撤回只撤掉最后一段**：这是 MaiBot 的智能分段机制，每段都是独立消息、
-  各有自己的 `message_id`。插件只保留最近一条，需要全撤就连续调用几次撤回。
+- **一次回复被切成多段，撤回只撤掉最后一段**（v1.2.0 已修）：分段插件把一条回复拆成多条独立消息、
+  各有自己的 `message_id`。v1.2.0 起插件按 `group_window_seconds` 聚合分段，`/recall` 与撤回工具
+  一次撤回该回复的全部段。若仍只撤一段，检查聚合窗口是否小于分段补发间隔（调大
+  `group_window_seconds`，或调小宿主 `response_post_process.typing_speed`）。
+- **与智能分段插件（smart_segmentation 等）共存的推荐配置**：
+  - 宿主 `bot_config.toml` 关闭内置分段：`[response_splitter] enable = false`（分段插件 README 要求）；
+  - 分段插件用小模型（`gpt-4o-mini` / `qwen-plus` 一类）即可，与本插件的自评模型互不影响；
+  - 若分段后自评出现「一条回复评了多次」，说明分段间隔超过了 `group_window_seconds`，调大该值
+    （上限 30 秒）即可；反之若两条独立回复被误并成一组一起撤回，调小该值。
 - **撤回报"适配器不可用"**：检查 napcat-adapter 是否加载、NapCat 是否在线；`ctx.api.call` 报「API 不存在」通常是适配器未装或版本 < 1.4.0。
 - **撤回报超时限**：QQ 平台限制约 2 分钟，插件按 120 秒保守截断。
 - **复读不触发**：确认文本长度 ≥ min_length、不是纯数字/超短英文单词、不在冷却期；`/命令` 消息不参与统计。

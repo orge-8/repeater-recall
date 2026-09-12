@@ -7,6 +7,10 @@
    - bot 消息发出后延迟数秒自评，判定不合适则自动撤回；
    - 注册 recall_last_message 工具，LLM 可在对话中主动调用撤回；
    - /recall 或 /撤回 命令手动撤回 bot 最近一条消息（仅管理员可用）。
+3. 分段感知（v1.2.0）：与智能分段插件（smart_segmentation 等）共存时，
+   同一条回复被拆成多条连续消息发送——聚合窗口内的出站消息合并为一条
+   逻辑回复：自评按合并后完整文本判定一次（省 N-1 次 LLM 调用），
+   /recall 与撤回工具一次撤回该回复的全部段（共享一个撤回配额）。
 
 撤回通过 napcat-adapter 的 adapter.napcat.action.call(action_name="delete_msg")
 实现，兼容负 message_id；适配器不可用时复读功能不受影响，撤回报可读错误。
@@ -86,6 +90,7 @@ _RECALL_EXPIRE_SECONDS = 120  # 超过 2 分钟的 bot 消息不再撤回（QQ �
 _BOT_IDS_RETRY_SECONDS = 300  # get_login_info 失败后 5 分钟内不再重试（能力未授权时否则每来一条消息刷一条告警）
 _REVIEW_FAIL_STREAK = 3  # 自评 LLM 连续失败几次后熔断
 _REVIEW_PAUSE_SECONDS = 600  # 熔断后暂停自评 10 分钟
+_REVIEW_TIMEOUT_FLOOR = 5  # 自评 LLM 调用超时下限（秒）：超时配置低于该值时按此兜底
 # 自评 LLM 调用超时改为可配置（recall.review_timeout_seconds，默认 60s）：
 # Host 侧 RPC 无内建超时，插件侧超时只是放弃等待，Host 仍会把请求跑完并计费；
 # 自评模型较慢（如 LongCat-2.0 平均 24s、p95 >50s）时 30s 超时必然白烧 token + 计入熔断。
@@ -96,6 +101,10 @@ _LAST_BOT_MSG_TTL = 3600  # bot 出站消息记录保留时长（远大于撤回
 _PRUNE_INTERVAL = 300  # 惰性清理节流：最多每 5 分钟扫一次
 _CTX_CACHE_TTL = 15  # 自评上下文缓存秒数（覆盖分段回复的连续自评）
 _TEXT_KEEP = 500  # 消息文本截断存储长度（对齐自评 prompt 的截断上限）
+_SEG_KEEP = 12  # 单条回复记录的最大分段数（对齐智能分段插件的 max_segments 上限 8-16）
+# 智能分段共存：分段回复的连续段间隔通常在几秒内（宿主模拟打字速度 + typing_speed 默认 1.0），
+# 超过窗口仍来的出站消息视为独立回复而非同一条的新分段
+_SEG_GROUP_JITTER_SECONDS = 2.0
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -163,10 +172,23 @@ class RecallSectionConfig(PluginConfigBase):
             "0 = 关闭语境感知，仅凭消息本身判断（历史接口异常时也会自动降级到此模式）"
         ),
     )
-    max_recalls_per_hour: int = Field(default=6, ge=1, le=60, description="每小时撤回总次数上限（含自评/工具/手动命令）")
+    max_recalls_per_hour: int = Field(
+        default=6, ge=1, le=60, description="每小时撤回总次数上限（含自评/工具/手动命令）"
+    )
     admin_ids: list[str] = Field(
         default_factory=list,
         description="可使用 /recall 撤回命令的管理员 QQ 列表（兼容 qq: 前缀，如 qq:你的QQ号）；为空时仅本地控制台可用",
+    )
+    group_window_seconds: float = Field(
+        default=6.0,
+        ge=0.5,
+        le=30.0,
+        description=(
+            "分段聚合窗口（秒）：与智能分段插件（smart_segmentation 等）共存时，同一条回复被拆成"
+            "多条连续消息发送，间隔小于该窗口的出站消息合并为一条逻辑回复——自评按合并后"
+            "完整文本判定一次、/recall 与撤回工具一次撤回全部分段。需大于分段插件的"
+            "补发间隔（宿主模拟打字 typing_speed 越大间隔越长）；设 0.5 可基本关闭聚合"
+        ),
     )
 
 
@@ -191,6 +213,9 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         """插件加载时执行。"""
         self._recent: dict[str, deque] = {}
         self._cooldown_until: dict[str, float] = {}
+        # 结构（v1.2.0 分段感知）：
+        # stream_id -> {"segments": [{"message_id","text","ts"}, ...], "ts": 最后一段到达时刻}
+        # 与智能分段插件共存时一次回复 = 多条消息，全部段都留在 segments 里供整组撤回
         self._last_bot_msg: dict[str, dict[str, Any]] = {}
         self._recall_times: deque = deque()
         self._tasks: set = set()
@@ -201,6 +226,9 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         self._ctx_cache: dict[str, tuple[float, str]] = {}  # 自评上下文缓存：stream_id -> (拉取时刻, 格式化文本)
         self._last_prune_at: float = 0.0  # 上次惰性清理时刻（按 _PRUNE_INTERVAL 节流）
         self._unknown_sender_seq: int = 0  # 解析不到发送者时的占位 ID 序号
+        # 聚合自评排程表：stream_id -> {"group": 分组引用, "task": 聚合自评任务}
+        # 同一分组只允许一个等待中的自评任务，后续分段到达不重复 spawn（v1.2.0）
+        self._pending_review: dict[str, dict[str, Any]] = {}
         cfg = self.config
         self.ctx.logger.info(
             "复读机与自主撤回已加载（复读=%s 阈值=%s 冷却=%ss；撤回=%s 自评=%s）",
@@ -274,6 +302,11 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         for sid, (fetched_at, _ctx) in list(self._ctx_cache.items()):
             if fetched_at < ctx_before:
                 del self._ctx_cache[sid]
+        # 聚合自评排程表：任务已结束的排程条目回收（任务还在等的不动）
+        for sid, pending in list(self._pending_review.items()):
+            task = pending.get("task")
+            if task is None or task.done():
+                self._pending_review.pop(sid, None)
 
     async def _ensure_bot_ids(self) -> set:
         """获取并缓存 bot 自身 user_id（get_login_info，陷阱篇：不要反查历史消息取机器人昵称）。
@@ -507,86 +540,184 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             self.ctx.logger.debug("自评上下文获取失败，降级为纯文本判定：%s", exc)
             return ""
 
-    async def _self_review(self, stream_id: str, message_id: Any, text: str) -> None:
-        """bot 消息发出后延迟自评，判定不合适则撤回。失败静默，仅记日志。"""
+    def _ensure_group_review(self, stream_id: str) -> None:
+        """确保当前分组有一个（且只有一个）等待收拢的聚合自评任务（v1.2.0）。
+
+        分段补发期间每条新段都会走到这里：分组未变且任务还在等 → 直接返回；
+        分组被新回复覆盖或任务已跑完 → 为新分组重新排程。
+        """
+        group = self._last_bot_msg.get(stream_id)
+        if not group:
+            return
+        pending = self._pending_review.get(stream_id)
+        task = pending.get("task") if pending else None
+        if pending and pending.get("group") is group and task is not None and not task.done():
+            return  # 该分组已有聚合自评任务在等待收拢
+        pending = {"group": group, "task": None}
+        self._pending_review[stream_id] = pending
+        new_task = asyncio.get_running_loop().create_task(self._self_review_grouped(stream_id))
+        pending["task"] = new_task
+        self._tasks.add(new_task)
+        new_task.add_done_callback(self._tasks.discard)
+
+    async def _self_review_grouped(self, stream_id: str) -> None:
+        """聚合自评（v1.2.0 分段感知）：等分组收拢后按完整逻辑回复判定一次。
+
+        与智能分段插件共存时，一条回复 = N 条消息，逐段自评会烧 N 次 LLM
+        且按孤立片段判定不合理。收拢判定：一轮 sleep（自评延迟 + 聚合窗口）
+        后分组时间戳仍在前进（分段还在补发）就再等一轮，稳定后才评审。
+        """
         try:
-            await asyncio.sleep(self.config.recall.review_delay_seconds)
-            if time.time() < self._review_paused_until:
-                return  # 熔断期内直接跳过，不刷日志
-            # 语境感知：拉取近期聊天记录帮助判断（失败自动降级为纯文本判定）
-            context = await self._fetch_review_context(
-                stream_id, message_id, self.config.recall.context_messages
-            )
-            safe_text = _neutralize_delimiters(text[:500])
-            if context:
-                prompt = _SELF_REVIEW_CTX_PROMPT.format(context=context, text=safe_text)
-            else:
-                prompt = _SELF_REVIEW_PROMPT.format(text=safe_text)
-            timeout_seconds = max(5, int(self.config.recall.review_timeout_seconds))
-            try:
-                result = await asyncio.wait_for(
-                    self.ctx.llm.generate(
-                        prompt=prompt, model=self.config.recall.review_model or ""
-                    ),
-                    timeout=timeout_seconds,
-                )
-            except (asyncio.TimeoutError, TimeoutError):
-                result = {
-                    "success": False,
-                    "error": f"自评 LLM 调用超时（超过 {timeout_seconds} 秒）",
-                }
-            except Exception as exc:
-                result = {"success": False, "error": f"{exc.__class__.__name__}: {exc}"}
-            if not isinstance(result, dict) or not result.get("success"):
-                self._on_review_failure(result)
+            pending = self._pending_review.get(stream_id)
+            if not pending:
                 return
-            self._review_fail_streak = 0  # 成功即清零
-            response = str(result.get("response") or "")
-            m = re.search(r"\{.*\}", response, re.S)
-            verdict = False
-            if m:
-                try:
-                    v = json.loads(m.group(0)).get("recall")
-                    # 仅接受布尔 true 或字符串 "true"，其余（含 "false"）一律不撤，
-                    # 避免 bool("false") is True 造成的误撤
-                    verdict = (v is True) or (isinstance(v, str) and v.strip().lower() == "true")
-                except (json.JSONDecodeError, AttributeError):
-                    verdict = False
-            if verdict:
-                # 配额预留放在判定成立之后：不撤/失败/解析不出的路径不消耗配额
-                if not self._reserve_recall_quota():
-                    self.ctx.logger.info("自评撤回达到每小时配额上限，跳过")
-                    return
-                ok, msg = await self._do_recall(message_id)
-                if ok:
-                    self.ctx.logger.info("自评撤回成功（stream=%s）：%.50s", stream_id, text)
-                    last = self._last_bot_msg.get(stream_id)
-                    if last and last.get("message_id") == message_id:
-                        self._last_bot_msg.pop(stream_id, None)
-                else:
-                    self.ctx.logger.warning("自评判定撤回但执行失败：%s", msg)
+            group = pending["group"]
+            window = float(getattr(self.config.recall, "group_window_seconds", 6.0))
+            target_gap = self.config.recall.review_delay_seconds + window
+            last_seen = group.get("ts", 0.0)
+            while True:
+                await asyncio.sleep(target_gap)
+                cur_ts = group.get("ts", 0.0)
+                if cur_ts == last_seen:
+                    break  # 一轮内没有新分段 → 分组已收拢
+                last_seen = cur_ts
+            cur = self._pending_review.get(stream_id)
+            if cur is pending:
+                self._pending_review.pop(stream_id, None)
+            segments = list(group.get("segments", []))
+            if not segments:
+                return
+            await self._self_review_grouped_inner(stream_id, group, segments)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.error("聚合自评流程异常：%s", exc, exc_info=True)
+
+    async def _self_review(self, stream_id: str, message_id: Any, text: str) -> None:
+        """单条消息自评（兼容入口）：按单段临时分组走同一条聚合评审链路。
+
+        生产链路由 handle_after_send → _ensure_group_review →
+        _self_review_grouped 驱动（分段感知聚合）；此入口保留给单条消息
+        的直接评审（测试、未来扩展）。失败静默，仅记日志。
+        """
+        try:
+            now = time.time()
+            segments = [{"message_id": message_id, "text": str(text)[:_TEXT_KEEP], "ts": now}]
+            group = {"segments": segments, "ts": now}
+            await self._self_review_grouped_inner(stream_id, group, segments)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self.ctx.logger.error("自评流程异常：%s", exc, exc_info=True)
 
+    async def _self_review_grouped_inner(self, stream_id: str, group: dict, segments: list) -> None:
+        """聚合自评主体：拼接 → 单次 LLM 判定 → 命中则整组撤回。"""
+        if time.time() < self._review_paused_until:
+            return
+        # 已超期段落剔除后为空 → 不评（QQ 撤回时限已过，评了也撤不了）
+        usable = [seg for seg in segments if time.time() - seg.get("ts", 0.0) <= _RECALL_EXPIRE_SECONDS]
+        if not usable:
+            return
+        # 纯占位段（[图片]/[文件] 等）不进评审文本，但没有可评文本时整组跳过
+        parts = [
+            str(seg.get("text") or "") for seg in usable
+            if not _RE_PLACEHOLDER_ONLY.match(str(seg.get("text") or "").strip())
+        ]
+        text = "\n".join(parts).strip()
+        if not text:
+            return
+        # 拼接后仍可能撞上纯占位（整组都是 [图片]/[文件] 等）
+        if _RE_PLACEHOLDER_ONLY.match(text.strip()):
+            self.ctx.logger.info("聚合文本为纯占位，跳过自评（stream=%s）：%.30s", stream_id, text)
+            return
+        # 该组最后一个 message_id 用于上下文去重（任选其一即可，组内同属一条回复）
+        context = await self._fetch_review_context(
+            stream_id, usable[-1].get("message_id"), self.config.recall.context_messages
+        )
+        safe_text = _neutralize_delimiters(text[:500])
+        if context:
+            prompt = _SELF_REVIEW_CTX_PROMPT.format(context=context, text=safe_text)
+        else:
+            prompt = _SELF_REVIEW_PROMPT.format(text=safe_text)
+        timeout_seconds = max(_REVIEW_TIMEOUT_FLOOR, int(self.config.recall.review_timeout_seconds))
+        try:
+            result = await asyncio.wait_for(
+                self.ctx.llm.generate(
+                    prompt=prompt, model=self.config.recall.review_model or ""
+                ),
+                timeout=timeout_seconds,
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            result = {
+                "success": False,
+                "error": f"自评 LLM 调用超时（超过 {timeout_seconds} 秒）",
+            }
+        except Exception as exc:
+            result = {"success": False, "error": f"{exc.__class__.__name__}: {exc}"}
+        if not isinstance(result, dict) or not result.get("success"):
+            self._on_review_failure(result)
+            return
+        self._review_fail_streak = 0  # 成功即清零
+        response = str(result.get("response") or "")
+        m = re.search(r"\{.*\}", response, re.S)
+        verdict = False
+        if m:
+            try:
+                v = json.loads(m.group(0)).get("recall")
+                # 仅接受布尔 true 或字符串 "true"，其余（含 "false"）一律不撤，
+                # 避免 bool("false") is True 造成的误撤
+                verdict = (v is True) or (isinstance(v, str) and v.strip().lower() == "true")
+            except (json.JSONDecodeError, AttributeError):
+                verdict = False
+        if verdict:
+            # 配额预留放在判定成立之后：不撤/失败/解析不出的路径不消耗配额
+            if not self._reserve_recall_quota():
+                self.ctx.logger.info("自评撤回达到每小时配额上限，跳过")
+                return
+            recalled_any = False
+            for seg in usable:
+                ok, msg = await self._do_recall(seg.get("message_id"))
+                if ok:
+                    recalled_any = True
+                else:
+                    self.ctx.logger.warning("自评撤回分段失败（id=%s）：%s", seg.get("message_id"), msg)
+            if recalled_any:
+                self.ctx.logger.info(
+                    "自评撤回成功（stream=%s，%d 段）：%.50s", stream_id, len(usable), text
+                )
+                # 组仍是当前组（未被更新的回复覆盖）时清掉记录
+                current = self._last_bot_msg.get(stream_id)
+                if current is group:
+                    self._last_bot_msg.pop(stream_id, None)
+
     def _record_bot_message(self, stream_id: str, message_id: Any, text: str) -> None:
-        """记录 bot 最近一条消息，供撤回工具与命令使用。
+        """记录 bot 出站消息，供撤回工具与命令使用（v1.2.0 分段感知）。
 
-        仅记录，不触发自评：自评统一由 handle_after_send 触发（对所有出站消息
-        必达），避免插件自己发送的消息在 _send_and_track 与主链路 after_send
-        两处各 spawn 一次自评（双倍 LLM 调用 + 双倍配额 + 并发撤回竞争）。
+        与智能分段插件共存时，一条逻辑回复由多条消息组成：距上一段到达时刻
+        小于 group_window_seconds 的新段追加进同一组；超过窗口视为独立回复
+        （覆盖旧组）。自评由 handle_after_send 统一触发（聚合版），这里只记录。
 
-        文本截断到 _TEXT_KEEP 存储：自评 prompt 只用前 500 字符，日志用 %.30s/%.50s，
-        全文驻留没有收益。
+        文本截断到 _TEXT_KEEP 存储；分段数超过 _SEG_KEEP 时丢弃最旧的段
+        （对齐分段插件 max_segments 上限，防异常刷屏撑爆记录）。
         """
         if message_id is None:
             return
-        self._last_bot_msg[stream_id] = {
-            "message_id": message_id,
-            "text": text[:_TEXT_KEEP],
-            "ts": time.time(),
-        }
+        now = time.time()
+        window = float(getattr(self.config.recall, "group_window_seconds", 6.0))
+        group = self._last_bot_msg.get(stream_id)
+        if group and now - group["ts"] <= window + _SEG_GROUP_JITTER_SECONDS:
+            # 聚合窗口内：追加为新分段（重复 message_id 不重复记）
+            if any(seg.get("message_id") == message_id for seg in group["segments"]):
+                return
+            group["segments"].append({"message_id": message_id, "text": text[:_TEXT_KEEP], "ts": now})
+            group["ts"] = now
+            if len(group["segments"]) > _SEG_KEEP:
+                group["segments"] = group["segments"][-_SEG_KEEP:]
+        else:
+            self._last_bot_msg[stream_id] = {
+                "segments": [{"message_id": message_id, "text": text[:_TEXT_KEEP], "ts": now}],
+                "ts": now,
+            }
 
     async def _send_and_track(self, stream_id: str, text: str) -> tuple[bool, str]:
         """发送文本并记录/自评。返回 (是否成功, 说明)。"""
@@ -600,6 +731,28 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         if sent:
             self._record_bot_message(stream_id, message_id, text)
         return sent, ("发送成功" if sent else "发送失败（详细信息见主进程日志 [cap.send.*]）")
+
+    async def _recall_group(self, stream_id: str, targets: list) -> tuple[bool, str]:
+        """整组撤回（v1.2.0）：一次配额内撤回一条逻辑回复的全部分段，共享成败语义。"""
+        recalled_any = False
+        last_error = ""
+        for target in targets:
+            ok, msg = await self._do_recall(target)
+            if ok:
+                recalled_any = True
+            else:
+                last_error = msg
+        if recalled_any:
+            group = self._last_bot_msg.get(stream_id)
+            if group and targets and any(
+                seg.get("message_id") in (targets if isinstance(targets, list) else [targets])
+                for seg in group.get("segments", [])
+            ):
+                self._last_bot_msg.pop(stream_id, None)
+            if len(targets) > 1:
+                return True, f"已撤回（共 {len(targets)} 段）"
+            return True, "已撤回"
+        return False, last_error or "撤回失败"
 
     @staticmethod
     def _normalize_admin_id(entry: str) -> str:
@@ -684,21 +837,26 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         return False, None
 
     async def _resolve_recall_target(self, stream_id: str) -> tuple[bool, Any]:
-        """解析撤回目标：优先内存记录，其次历史兜底。
+        """解析撤回目标：优先内存分组记录，其次历史兜底。
 
-        - 内存有记录：未过期直接用；已过期直接报「超时」，不再走历史
-          （历史里找到的只会是同一条，同样过期，白查一次）。
-        - 内存无记录（如 Maisaka 主链路消息未被 hook 记录、插件刚加载）→ 查近期历史。
+        v1.2.0 分段感知：返回当前逻辑回复的全部可撤回分段 message_id 列表。
+        - 内存有分组：剔除已超时段后返回；全部超期 → 报「超时」；
+        - 内存无记录（如插件刚加载、hook 未触发）→ 查近期历史，找到的 bot
+          消息按 group_window 聚合成组返回。
         """
-        last = self._last_bot_msg.get(stream_id)
-        if last:
-            if time.time() - last["ts"] > _RECALL_EXPIRE_SECONDS:
-                return False, "最近一条 bot 消息已超过 2 分钟，超出 QQ 撤回时限"
-            return True, last["message_id"]
+        group = self._last_bot_msg.get(stream_id)
+        if group:
+            usable = [
+                seg["message_id"] for seg in group.get("segments", [])
+                if time.time() - seg.get("ts", 0.0) <= _RECALL_EXPIRE_SECONDS
+            ]
+            if usable:
+                return True, usable
+            return False, "最近一条 bot 消息已超过 2 分钟，超出 QQ 撤回时限"
         found, mid = await self._find_recent_bot_message(stream_id)
         if found:
             self.ctx.logger.info("已通过历史消息定位到 bot 可撤回消息（stream=%s）", stream_id)
-            return True, mid
+            return True, [mid]
         return False, "没有可撤回的 bot 消息"
 
     # ------------------------------------------------------------------
@@ -768,11 +926,8 @@ class RepeaterRecallPlugin(MaiBotPlugin):
                 stream_id, sorted(message.keys()),
             )
             return {"action": "continue"}
-        self._last_bot_msg[stream_id] = {
-            "message_id": mid,
-            "text": text,
-            "ts": time.time(),
-        }
+        # 先聚合记录（分段感知：窗口内的连续出站消息合并为一条逻辑回复）
+        self._record_bot_message(stream_id, mid, text)
         self.ctx.logger.info("已记录 bot 出站消息（stream=%s id=%s）：%.30s", stream_id, mid, text)
         # 纯占位文本（语音/图片/文件等无语义载荷）没有可判定内容，跳过自评省一次 LLM 调用
         if _RE_PLACEHOLDER_ONLY.match(text.strip()):
@@ -780,7 +935,7 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             return {"action": "continue"}
         # 熔断期内不创建空转自评任务（任务内 sleep 后的熔断检查仍保留，覆盖 spawn 后才熔断的情况）
         if self.config.recall.self_review and time.time() >= self._review_paused_until:
-            self._spawn(self._self_review(stream_id, mid, text))
+            self._ensure_group_review(stream_id)
         return {"action": "continue"}
 
     async def _repeat_send(self, stream_id: str, text: str) -> None:
@@ -795,7 +950,7 @@ class RepeaterRecallPlugin(MaiBotPlugin):
     @Tool(
         "recall_last_message",
         description=(
-            "撤回机器人在当前聊天流最近发出的一条消息。"
+            "撤回机器人在当前聊天流最近发出的一条消息（含智能分段场景下同一条回复的全部分段）。"
             "当发现自己刚才的回复明显不合适、易引战、严重答非所问或可能违规时调用。"
             "没有可撤回消息、消息超过 2 分钟或超出每小时撤回配额时会返回原因。"
             "参数 stream_id：当前聊天流 ID。"
@@ -815,15 +970,14 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             return {"content": "自主撤回功能未启用"}
         if not stream_id:
             return {"content": "缺少 stream_id，无法撤回"}
-        ok, target = await self._resolve_recall_target(stream_id)
+        ok, targets = await self._resolve_recall_target(stream_id)
         if not ok:
-            return {"content": target}
+            return {"content": targets}
         if not self._reserve_recall_quota():
             return {"content": "已达到每小时撤回次数上限，暂时无法撤回"}
-        recalled, msg = await self._do_recall(target)
+        recalled, msg = await self._recall_group(stream_id, targets)
         if recalled:
-            self._last_bot_msg.pop(stream_id, None)
-            return {"content": "已撤回刚才那条消息"}
+            return {"content": f"已撤回刚才那条消息（共 {len(targets)} 段）" if len(targets) > 1 else "已撤回刚才那条消息"}
         return {"content": msg}
 
     @Command("recall", description="管理员手动撤回 bot 最近一条消息", pattern=r"^\s*[/／]\s*(?:recall|撤回)\s*$")
@@ -848,16 +1002,14 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             self.ctx.logger.error("撤回命令载荷里没有 stream_id（字段=%s）", sorted(kwargs))
             reply = "无法识别当前聊天，撤回失败"
         else:
-            ok, target = await self._resolve_recall_target(stream_id)
+            ok, targets = await self._resolve_recall_target(stream_id)
             if not ok:
-                reply = target
+                reply = targets
             elif not self._reserve_recall_quota():
                 reply = "已达到每小时撤回次数上限"
             else:
-                recalled, msg = await self._do_recall(target)
+                recalled, msg = await self._recall_group(stream_id, targets)
                 reply = msg
-                if recalled:
-                    self._last_bot_msg.pop(stream_id, None)
         sent = False
         if stream_id:
             try:
