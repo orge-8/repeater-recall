@@ -147,11 +147,19 @@ class RecallSectionConfig(PluginConfigBase):
     enabled: bool = Field(default=True, description="是否启用自主撤回")
     self_review: bool = Field(default=True, description="bot 消息发出后是否自动自评撤回")
     review_delay_seconds: int = Field(default=8, ge=1, le=120, description="发送后延迟几秒再自评")
+    review_task: str = Field(
+        default="",
+        description=(
+            "自评用的**模型任务名**（如 utils / replyer / planner / vlm），对应 SDK 侧 task_name 参数；"
+            "留空则由 SDK 默认任务决定（MaiBot 1.2.5 起默认 utils）。这是「任务」不是「模型」"
+        ),
+    )
     review_model: str = Field(
         default="",
         description=(
-            "自评用的模型名；留空则用 Host 默认。若日志报「任务 plugin.<插件ID> 的模型 <xxx-embedding> 参数不正确」，"
-            "说明 Host 没给本插件配文本生成模型，把这里填成具体模型名（如 utils / replyer 用的模型）即可绕过"
+            "自评用的**具体模型名**（model_config.toml 中 [[models]] 的 name），对应 model 参数；"
+            "留空则用该任务的模型选择策略。注意 MaiBot 1.2.5 起「模型任务名」与「具体模型名」是两个独立参数，"
+            "把任务名（如 planner / utils）填在这里会报「未找到名为 xxx 的模型」——任务名请填 review_task"
         ),
     )
     review_timeout_seconds: int = Field(
@@ -469,7 +477,23 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             return False, f"撤回失败：{first_error}"
         return True, "已撤回"
 
-    def _on_review_failure(self, result: Any) -> None:
+    async def _diagnose_llm_models(self) -> str:
+        """尽力列出 Host 当前可用的模型任务名，供「未找到名为 … 的模型」类错误定位。
+
+        纯诊断增强：能力未授权或调用失败都静默降级成一句说明，绝不影响主流程。
+        """
+        try:
+            names = await self.ctx.llm.get_available_models()
+        except Exception as exc:
+            return f"（查询可用模型任务名失败：{exc.__class__.__name__}，检查 manifest 是否声明 llm.get_available_models）"
+        if not names:
+            return (
+                "Host 未返回**任何**可用模型任务名 —— 这通常意味着 model_config.toml 里模型列表为空："
+                "去 WebUI 先保存提供商（provider），再添加模型，最后把任务指到具体模型"
+            )
+        return "Host 当前可用模型任务名：" + "、".join(str(n) for n in names)
+
+    async def _on_review_failure(self, result: Any) -> None:
         """自评 LLM 调用失败处理：累计次数，达到阈值熔断一段时间并给出可操作提示。"""
         self._review_fail_streak += 1
         err = ""
@@ -481,14 +505,27 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             return
         self._review_fail_streak = 0
         self._review_paused_until = time.time() + _REVIEW_PAUSE_SECONDS
+        # 「未找到名为 X 的模型」= 名字在该任务的候选里找不到；
+        # 1.2.5 起「模型任务名」与「具体模型名」是两个独立参数，混填是最常见成因。
+        extra = ""
+        if "未找到名为" in err:
+            extra = (
+                "\n  该错误说明模型层解析不到这个名字。MaiBot 1.2.5 起两个参数是分开的："
+                "task_name = **模型任务名**（utils / replyer / planner / vlm …），"
+                "model = **具体模型名**（model_config.toml 里 [[models]] 的 name）。"
+                "把任务名填进 model（或反之）就会报这个错。\n  " + await self._diagnose_llm_models()
+            )
         self.ctx.logger.error(
             "自评 LLM 连续失败 %d 次，暂停自评 %d 分钟。原始错误：%s\n"
-            "  处置三选一（任选其一即可）：\n"
-            "  1) 在 model_config.toml 里给任务 'plugin.%s' 配一个可用的文本生成模型"
-            "（若报错里出现 xxx-embedding，说明 Host 把本插件的 LLM 任务路由到了向量模型）；\n"
-            "  2) 把本插件配置 recall.review_model 填成具体模型名，绕过任务路由；\n"
+            "  本次调用 review_task=%r review_model=%r（都为空则用 SDK/Host 默认任务）%s\n"
+            "  处置（任选其一即可）：\n"
+            "  1) 去 WebUI 确认模型列表非空：先保存提供商，再添加模型，并把任务指到具体模型"
+            "（模型列表为空时任何任务名都解析不到，这正是 1.2.5 前 WebUI 的已知缺陷）；\n"
+            "  2) 想指定任务就在本插件配置 recall.review_task 填任务名（如 utils / replyer），"
+            "想指定具体模型就填 recall.review_model，两者别混；\n"
             "  3) 把 recall.self_review 设为 false 关闭自评（撤回工具与 /recall 命令不受影响）。",
-            _REVIEW_FAIL_STREAK, _REVIEW_PAUSE_SECONDS // 60, err or result, self.ctx.plugin_id,
+            _REVIEW_FAIL_STREAK, _REVIEW_PAUSE_SECONDS // 60, err or result,
+            self.config.recall.review_task, self.config.recall.review_model, extra,
         )
 
     async def _fetch_review_context(self, stream_id: str, message_id: Any, limit: int) -> str:
@@ -640,11 +677,18 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         else:
             prompt = _SELF_REVIEW_PROMPT.format(text=safe_text)
         timeout_seconds = max(_REVIEW_TIMEOUT_FLOOR, int(self.config.recall.review_timeout_seconds))
+        # MaiBot 1.2.5 起「模型任务名」与「具体模型名」是两个独立参数：
+        #   task_name = 任务名（utils / replyer / planner …）→ review_task
+        #   model     = 具体模型名（[[models]] 的 name）    → review_model
+        # 两个配置都留空时不传（SDK 2.8.1+ 会带上默认 task_name=utils，行为与旧版一致）。
+        llm_kwargs: dict[str, Any] = {}
+        if self.config.recall.review_task:
+            llm_kwargs["task_name"] = self.config.recall.review_task
+        if self.config.recall.review_model:
+            llm_kwargs["model"] = self.config.recall.review_model
         try:
             result = await asyncio.wait_for(
-                self.ctx.llm.generate(
-                    prompt=prompt, model=self.config.recall.review_model or ""
-                ),
+                self.ctx.llm.generate(prompt=prompt, **llm_kwargs),
                 timeout=timeout_seconds,
             )
         except (asyncio.TimeoutError, TimeoutError):
@@ -655,7 +699,7 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         except Exception as exc:
             result = {"success": False, "error": f"{exc.__class__.__name__}: {exc}"}
         if not isinstance(result, dict) or not result.get("success"):
-            self._on_review_failure(result)
+            await self._on_review_failure(result)
             return
         self._review_fail_streak = 0  # 成功即清零
         response = str(result.get("response") or "")
@@ -780,7 +824,11 @@ class RepeaterRecallPlugin(MaiBotPlugin):
                 info = msg.get("message_info") or {}
                 user = info.get("user_info") or info.get("user") or {}
                 user_id = str(user.get("user_id") or user.get("id") or "")
-        return bool(user_id) and user_id.lower() in admins
+        # 两侧必须用同一套归一化：Host 版本的 user_id 可能带 qq: 前缀、
+        # 也可能只是纯号（1.2.5 起「操作员权限匹配不再整体转小写 user_id」）。
+        # 只给配置侧剥前缀会造成不对称匹配失败——管理员被拒。
+        normalized_uid = self._normalize_admin_id(user_id)
+        return bool(normalized_uid) and normalized_uid in admins
 
     def _outgoing_is_from_bot(self, message: dict, bot_ids: set | None = None) -> bool:
         """判断出站 SessionMessage 是否 bot 自己发的。
