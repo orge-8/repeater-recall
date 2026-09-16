@@ -11,6 +11,11 @@
    同一条回复被拆成多条连续消息发送——聚合窗口内的出站消息合并为一条
    逻辑回复：自评按合并后完整文本判定一次（省 N-1 次 LLM 调用），
    /recall 与撤回工具一次撤回该回复的全部段（共享一个撤回配额）。
+4. 自评 LLM 参数自愈（v1.2.3）：MaiBot 1.2.5 起「模型任务名」(task_name) 与
+   「具体模型名」(model) 是两个独立参数，把 planner / utils 之类任务名填进
+   recall.review_model 会稳定报「未找到名为 'planner' 的模型」。插件在调用前
+   用 Host 的可用任务名清单纠偏（改按 task_name 调用），调用后首次失败即给出
+   完整诊断，并在本会话内停用被拒参数，避免每条回复都白烧一次 LLM 调用。
 
 撤回通过 napcat-adapter 的 adapter.napcat.action.call(action_name="delete_msg")
 实现，兼容负 message_id；适配器不可用时复读功能不受影响，撤回报可读错误。
@@ -94,6 +99,19 @@ _REVIEW_TIMEOUT_FLOOR = 5  # 自评 LLM 调用超时下限（秒）：超时配�
 # 自评 LLM 调用超时改为可配置（recall.review_timeout_seconds，默认 60s）：
 # Host 侧 RPC 无内建超时，插件侧超时只是放弃等待，Host 仍会把请求跑完并计费；
 # 自评模型较慢（如 LongCat-2.0 平均 24s、p95 >50s）时 30s 超时必然白烧 token + 计入熔断。
+
+# MaiBot 内置模型任务名（model_config.toml 的 model_task_config / 模型管理页里的任务）：
+# 用于识别「把任务名填进了 review_model」这类混填——planner / utils 是**任务**而不是模型名。
+# 判定要求「既在内置任务名白名单里，又出现在 Host 返回的可用任务名清单里」双重命中，
+# 避免把真实模型名（[[models]] 的 name）误判成任务名而改错调用方式。
+_KNOWN_TASK_NAMES = frozenset({
+    "utils", "utils_small", "replyer", "planner", "tool_use", "vlm",
+    "voice", "embedding", "lpmm_entity_extract", "lpmm_rdf_build", "lpmm_qa",
+})
+# 可用任务名清单缓存秒数：自评频率高（每条逻辑回复一次），避免每次都多一次 RPC
+_TASK_NAMES_CACHE_TTL = 60
+# 查询可用任务名的超时（秒）：Host RPC 无内建超时，诊断调用不能把自评流程卡死
+_TASK_NAMES_TIMEOUT = 8
 
 # 内存与性能控制（硬编码，不暴露为配置项）
 _STREAM_IDLE_SECONDS = 3600  # 沉默流的复读统计/冷却状态保留时长
@@ -231,6 +249,17 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         self._bot_ids_checked_at: float = 0.0  # 上次尝试 get_login_info 的时刻（失败也记，用于退避）
         self._review_fail_streak: int = 0  # 自评 LLM 连续失败次数
         self._review_paused_until: float = 0.0  # 自评熔断截止时间
+        # 自评 LLM 参数自愈状态（v1.2.3）：
+        # Host 报「未找到名为 X 的模型」属配置性问题（任务名/模型名混填），重试不会自愈，
+        # 因此把被判无效的那个参数在本会话内停用（不写回 config.toml），让后续自评自动回落，
+        # 同时首次就打出完整诊断，用户改完配置热重载即恢复。
+        self._review_model_disabled: bool = False  # review_model 被判无效 → 本会话不再传 model
+        self._task_name_disabled: bool = False  # review_task 被判无效 → 本会话不再传 task_name
+        self._review_model_as_task: bool = False  # review_model 实为任务名 → 已自动改走 task_name
+        self._model_err_reported: bool = False  # 完整诊断只打一次，防高频失败刷屏
+        self._task_names_cache: tuple[float, list[str]] | None = None  # 可用任务名清单缓存
+        self._task_names_error: str = ""  # 上次查询可用任务名失败的原因（诊断回显用）
+        self._last_review_llm_kwargs: dict[str, Any] = {}  # 自评实际传出的 LLM 参数（失败回显用）
         self._ctx_cache: dict[str, tuple[float, str]] = {}  # 自评上下文缓存：stream_id -> (拉取时刻, 格式化文本)
         self._last_prune_at: float = 0.0  # 上次惰性清理时刻（按 _PRUNE_INTERVAL 节流）
         self._unknown_sender_seq: int = 0  # 解析不到发送者时的占位 ID 序号
@@ -246,6 +275,15 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             cfg.recall.enabled,
             cfg.recall.self_review,
         )
+        # 自评 LLM 参数直接回显：真机报「未找到名为 xxx 的模型」时，
+        # 这条启动日志 + 失败日志的实参回显就能定位是哪个配置项填错了
+        if cfg.recall.self_review:
+            self.ctx.logger.info(
+                "自评 LLM 参数：review_task=%r（模型任务名，如 utils/replyer/planner）"
+                " review_model=%r（具体模型名，[[models]] 的 name）",
+                cfg.recall.review_task,
+                cfg.recall.review_model,
+            )
 
     async def on_unload(self) -> None:
         """插件卸载时执行。"""
@@ -263,14 +301,25 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         cfg = self.config
         # 阈值变化时重建各聊天流的统计队列
         self._recent.clear()
+        # 清掉上一版 LLM 参数的自愈状态与缓存：让「改完 review_task / review_model」立即生效，
+        # 而不是继续沿用上一版被判无效而停用的参数（否则用户改完配置仍看不到变化）
+        self._review_model_disabled = False
+        self._task_name_disabled = False
+        self._review_model_as_task = False
+        self._model_err_reported = False
+        self._task_names_cache = None
+        self._task_names_error = ""
         self.ctx.logger.info(
-            "配置已热重载（scope=%s）：复读=%s 阈值=%s 冷却=%ss；撤回=%s 自评=%s",
+            "配置已热重载（scope=%s）：复读=%s 阈值=%s 冷却=%ss；撤回=%s 自评=%s"
+            "（自评 LLM 参数 review_task=%r review_model=%r）",
             scope,
             cfg.repeat.enabled,
             cfg.repeat.threshold,
             cfg.repeat.cooldown_seconds,
             cfg.recall.enabled,
             cfg.recall.self_review,
+            cfg.recall.review_task,
+            cfg.recall.review_model,
         )
 
     # ------------------------------------------------------------------
@@ -477,15 +526,92 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             return False, f"撤回失败：{first_error}"
         return True, "已撤回"
 
+    async def _available_task_names(self, refresh: bool = False) -> list[str]:
+        """取 Host 当前可用的**模型任务名**清单（带 TTL 缓存，永不抛异常）。
+
+        `llm.get_available_models` 返回的是任务名（utils / replyer / planner …），
+        不是 `[[models]]` 里的具体模型名——真机返回空表通常意味着模型列表为空。
+        """
+        now = time.time()
+        cache = self._task_names_cache
+        if cache and not refresh and now - cache[0] < _TASK_NAMES_CACHE_TTL:
+            return cache[1]
+        try:
+            # Host RPC 无内建超时：诊断类调用绝不能把自评流程卡死，超时按「查不到」处理
+            names = await asyncio.wait_for(
+                self.ctx.llm.get_available_models(), timeout=_TASK_NAMES_TIMEOUT
+            )
+            self._task_names_error = ""
+        except (asyncio.TimeoutError, TimeoutError):
+            self._task_names_error = f"查询超时（超过 {_TASK_NAMES_TIMEOUT} 秒）"
+            names = []
+        except Exception as exc:
+            self._task_names_error = f"{exc.__class__.__name__}: {exc}"
+            names = []
+        names = [str(n) for n in (names or [])]
+        self._task_names_cache = (now, names)
+        return names
+
+    async def _resolve_review_llm_kwargs(self) -> dict[str, Any]:
+        """决定本次自评的 LLM 参数，并纠正「任务名/模型名」混填。
+
+        MaiBot 1.2.5 起两个参数是独立的：
+          task_name = 模型任务名（utils / replyer / planner …）→ recall.review_task
+          model     = 具体模型名（[[models]] 的 name）        → recall.review_model
+
+        把任务名填进 `review_model` 会稳定报「未找到名为 'planner' 的模型」。
+        这里在**调用前**就用 Host 的可用任务名清单做一次纠偏：命中即丢弃该 model 参数，
+        必要时改按任务名调用，自评不中断，并提示去改配置。
+        默认配置（两项都空）不会触发任何额外 RPC。
+
+        语义优先级：`review_task` 是显式指定的任务，**永远不被 review_model 覆盖**——
+        两者都填了任务名时（真机常见：`review_model = "planner"` + `review_task = "planner"`），
+        只丢掉误填的 model，保留 review_task。
+        """
+        cfg = self.config.recall
+        task_name = str(cfg.review_task or "").strip()
+        model = str(cfg.review_model or "").strip()
+        kwargs: dict[str, Any] = {}
+        if task_name and not self._task_name_disabled:
+            kwargs["task_name"] = task_name
+        if model and not self._review_model_disabled:
+            # 双重确认才纠偏：内置任务名白名单 + Host 实际返回的可用任务名清单。
+            # 左侧短路，所以默认不填 review_model 时不会有额外 RPC。
+            if model in _KNOWN_TASK_NAMES and model in await self._available_task_names():
+                kwargs.pop("model", None)  # 无论哪种情况都不能把它当具体模型名传
+                if kwargs.get("task_name"):
+                    note = (
+                        f"recall.review_model=%r 与 recall.review_task=%r 都是**任务名**，"
+                        "已忽略 review_model、继续用 review_task"
+                    )
+                else:
+                    note = (
+                        f"recall.review_model=%r 是**模型任务名**而不是具体模型名，"
+                        "本次起自动改按任务名调用以避免自评失败"
+                    )
+                if not self._review_model_as_task:
+                    self._review_model_as_task = True
+                    self.ctx.logger.warning(
+                        "%s；建议清空 recall.review_model（任务名请只填 recall.review_task，热重载生效）",
+                        note,
+                    )
+                if not kwargs.get("task_name"):
+                    kwargs["task_name"] = model
+                return kwargs
+            kwargs["model"] = model
+        return kwargs
+
     async def _diagnose_llm_models(self) -> str:
         """尽力列出 Host 当前可用的模型任务名，供「未找到名为 … 的模型」类错误定位。
 
         纯诊断增强：能力未授权或调用失败都静默降级成一句说明，绝不影响主流程。
         """
-        try:
-            names = await self.ctx.llm.get_available_models()
-        except Exception as exc:
-            return f"（查询可用模型任务名失败：{exc.__class__.__name__}，检查 manifest 是否声明 llm.get_available_models）"
+        names = await self._available_task_names(refresh=True)
+        if self._task_names_error:
+            return (
+                f"（查询可用模型任务名失败：{self._task_names_error}，"
+                "检查 manifest 是否声明 llm.get_available_models）"
+            )
         if not names:
             return (
                 "Host 未返回**任何**可用模型任务名 —— 这通常意味着 model_config.toml 里模型列表为空："
@@ -493,12 +619,59 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             )
         return "Host 当前可用模型任务名：" + "、".join(str(n) for n in names)
 
+    async def _handle_model_name_error(self, err: str) -> None:
+        """「未找到名为 X 的模型」：停用被拒参数 + 首次即给出完整诊断（v1.2.3）。
+
+        这是**配置性**错误，重试不会自愈，所以不再等到第 3 次熔断才提示：
+        - 第 1 次出现就打出「实际传出的参数 + Host 可用任务名清单 + 修复步骤」；
+        - 同时把被拒的那个参数在本会话内停用（不写回 config.toml），
+          让后续自评自动回落到可用路径，不会每条回复都白烧一次调用。
+        """
+        sent = self._last_review_llm_kwargs
+        m = re.search(r"未找到名为\s*['\"]?([^'\"\s，。]+)['\"]?\s*的模型", err)
+        bad = m.group(1) if m else ""
+        disabled: list[str] = []
+        if bad and bad == str(sent.get("model") or ""):
+            self._review_model_disabled = True
+            disabled.append("review_model")
+        if bad and bad == str(sent.get("task_name") or ""):
+            self._task_name_disabled = True
+            disabled.append("review_task")
+        if self._model_err_reported:
+            if disabled:
+                self.ctx.logger.warning(
+                    "已在本会话内停用无效的自评 LLM 参数 %s（未改配置文件），"
+                    "自评将回落到默认任务，不会反复失败", "、".join(disabled),
+                )
+            return
+        self._model_err_reported = True
+        await self._available_task_names(refresh=True)  # 预热缓存，供 _diagnose_llm_models 复用
+        tail = ""
+        if disabled:
+            tail = (
+                f"\n  已将无效配置 {'、'.join(disabled)} 在本会话内停用，自评回落到默认任务；"
+                "改完 config.toml（或 WebUI）热重载即恢复使用新值。"
+            )
+        self.ctx.logger.error(
+            "自评 LLM 报「未找到名为 %r 的模型」。本次实际传出：task_name=%r model=%r。"
+            "该报错说明模型层解析不到这个名字 —— MaiBot 1.2.5 起两个参数是分开的："
+            "task_name = **模型任务名**（utils / replyer / planner / vlm …），"
+            "model = **具体模型名**（model_config.toml 里 [[models]] 的 name）；"
+            "把任务名填进 review_model（或把模型名填进 review_task）就会报这个错。\n  %s%s",
+            bad or "?", sent.get("task_name", ""), sent.get("model", ""),
+            await self._diagnose_llm_models(), tail,
+        )
+
     async def _on_review_failure(self, result: Any) -> None:
         """自评 LLM 调用失败处理：累计次数，达到阈值熔断一段时间并给出可操作提示。"""
         self._review_fail_streak += 1
         err = ""
         if isinstance(result, dict):
             err = str(result.get("error") or result.get("response") or "")
+        # 「未找到名为 X 的模型」是配置性问题，重试不会自愈 —— 首次出现就诊断 + 停用错参数，
+        # 不再等到第 3 次熔断才给答案（熔断计数逻辑保持不变）
+        if "未找到名为" in err:
+            await self._handle_model_name_error(err)
         if self._review_fail_streak < _REVIEW_FAIL_STREAK:
             self.ctx.logger.warning("自评 LLM 调用失败（第 %d/%d 次）：%s",
                                     self._review_fail_streak, _REVIEW_FAIL_STREAK, err or result)
@@ -681,11 +854,9 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         #   task_name = 任务名（utils / replyer / planner …）→ review_task
         #   model     = 具体模型名（[[models]] 的 name）    → review_model
         # 两个配置都留空时不传（SDK 2.8.1+ 会带上默认 task_name=utils，行为与旧版一致）。
-        llm_kwargs: dict[str, Any] = {}
-        if self.config.recall.review_task:
-            llm_kwargs["task_name"] = self.config.recall.review_task
-        if self.config.recall.review_model:
-            llm_kwargs["model"] = self.config.recall.review_model
+        # v1.2.3 起由 _resolve_review_llm_kwargs 统一决定，并顺带纠正任务名/模型名混填。
+        llm_kwargs = await self._resolve_review_llm_kwargs()
+        self._last_review_llm_kwargs = dict(llm_kwargs)  # 失败诊断回显实参用
         try:
             result = await asyncio.wait_for(
                 self.ctx.llm.generate(prompt=prompt, **llm_kwargs),

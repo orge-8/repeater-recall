@@ -14,6 +14,7 @@ MaiBot 插件：经典复读机 + LLM 自主撤回。
    - **`/recall` 与 LLM 撤回工具一次撤回该回复的全部段**（共享一次撤回配额）；
    - 组内超 2 分钟（QQ 撤回时限）的段自动剔除，剩余段照常可撤；
    - 复读跟读不受影响：分段插件只处理主回复链路的产出，不会切分插件自己发送的消息。
+7. **自评 LLM 参数自愈（v1.2.3 新增）**：`recall.review_model` 误填模型**任务名**（`planner` / `utils` …）时自动改按任务名调用；Host 报「未找到名为 X 的模型」时首次即打完整诊断并停用被拒参数，避免自评持续失败与白烧调用。详见「故障排查」。
 
 ### 撤回目标的两级定位
 
@@ -65,7 +66,7 @@ MaiBot 插件：经典复读机 + LLM 自主撤回。
 | self_review | true | 发送后自动自评撤回 |
 | review_delay_seconds | 8 | 发送后延迟几秒自评（1–120） |
 | review_task | `""` | 自评用的**模型任务名**（`utils` / `replyer` / `planner` / `vlm` …），走 SDK 的 `task_name` 参数；留空则由 SDK 默认任务决定（MaiBot 1.2.5 起默认 `utils`）。**这是「任务」不是「模型」** |
-| review_model | `""` | 自评用的**具体模型名**（`model_config.toml` 里 `[[models]]` 的 `name`），走 `model` 参数；留空则用该任务的模型选择策略。⚠️ MaiBot 1.2.5 起「任务名」与「模型名」是两个独立参数，把任务名（如 `planner`）填在这里会报「未找到名为 planner 的模型」——任务名请填 `review_task` |
+| review_model | `""` | 自评用的**具体模型名**（`model_config.toml` 里 `[[models]]` 的 `name`），走 `model` 参数；留空则用该任务的模型选择策略。⚠️ MaiBot 1.2.5 起「任务名」与「模型名」是两个独立参数，把任务名（如 `planner`）填在这里会报「未找到名为 planner 的模型」——任务名请填 `review_task`。**v1.2.3 起该混填会被自动识别并改按任务名调用**（详见「故障排查」） |
 | review_timeout_seconds | 60 | 单次自评 LLM 调用超时秒数（5–300）。插件侧超时只是放弃等待，Host 仍会把请求跑完并计费；自评模型较慢（平均耗时 >20s）时建议调大，避免反复超时触发熔断 |
 | context_messages | 10 | 自评时带入的近期聊天记录条数，用于语境判断（接梗/玩谐音/回应点名不算跑题）；0 = 关闭语境感知，仅凭消息本身判断。历史接口异常时自动降级为纯文本判定，不影响撤回链路（0–50） |
 | max_recalls_per_hour | 6 | 每小时撤回总次数上限（含自评/工具/手动命令）（1–60） |
@@ -87,34 +88,32 @@ MaiBot 插件：经典复读机 + LLM 自主撤回。
 - `max_recalls_per_hour` 对自评 / LLM 工具 / 命令三条撤回路径统一生效。
 - 自评 LLM 调用超时可配置（`review_timeout_seconds`，默认 60 秒），失败/超时连续 3 次熔断 10 分钟，避免刷屏与后台任务堆积。
 - 纯占位文本出站消息（如 `[voiceurl消息]`、`[图片]`）没有可判定语义，跳过自评省一次 LLM 调用；消息仍记录，撤回不受影响。
-- 自评失败熔断时，若错误是「未找到名为 xxx 的模型」，日志会附带**本次实际传出的 `model` 参数值**与
-  **Host 当前可用模型任务名清单**（经 `llm.get_available_models`），不需要再去翻 `model_config.toml` 猜。
+- 自评失败熔断时，若错误是「未找到名为 xxx 的模型」，日志会附带**本次实际传出的 `task_name` / `model` 参数值**与
+  **Host 当前可用模型任务名清单**（经 `llm.get_available_models`），不需要再去翻 `model_config.toml` 猜；
+  v1.2.3 起该诊断**首次出现即打**，并把被拒参数在本会话内停用（不写回 `config.toml`）以避免持续白烧调用。
 
 ## 测试方式（本地，无需真机）
 
+插件目录自带 `tests/`（FakeHost 假宿主，不需要完整 MaiBot 环境），门禁一键跑：
+
 ```bash
-# 在 MaiBot插件开发/ 目录下
-.venv/Scripts/python.exe check_plugin.py plugins/repeater-recall          # 结构自检
-.venv/Scripts/python.exe smoke_test.py plugins/repeater-recall            # 生命周期冒烟
-.venv/Scripts/python.exe test_repeater_recall.py                          # 功能直调测试（100 项）
-.venv/Scripts/python.exe test_repeater_recall_extra.py                    # 上线前增量 QA（47 项）
-.venv/Scripts/python.exe test_repeater_recall_seg.py                      # 分段感知专项（21 项，v1.2.0）
-.venv/Scripts/python.exe run_gates.py plugins/repeater-recall             # check + smoke 双门禁
+# Git Bash（devkit 自带含 SDK 的 venv）
+/c/Users/38160/Desktop/tools/maibot-devkit/gate.sh /c/Users/38160/Desktop/repeater-recall
+
+# 或直接调编排脚本（check_plugin → tests/smoke_test.py → pytest tests）
+.venv/Scripts/python.exe run_gates.py --plugin <插件目录> --python <含 maibot_sdk 的解释器>
 ```
 
-基础套件覆盖：装饰器-函数配对、复读触发/冷却/分流、过滤规则、撤回四态（成功/失败/适配器缺失/超时）、
-配额、自评三态（该撤/不撤/垃圾响应）、命令鉴权五种身份、**after_send 记录五态**（主链路含负数
-message_id / sent=False / 缺 ID / 非 bot / 登录信息不可用降级）、**历史兜底六态**（命中/无 bot 消息/
-过期/缺时间戳/内存优先/接口故障静默）、**manifest 能力声明 + 退避熔断九态**（失败退避/退避期内不重试/
-退避过期恢复/成功后缓存/自评熔断/熔断不误伤撤回/review_model 透传/默认空串/成功后清零）。
+| 文件 | 覆盖 |
+|---|---|
+| `tests/smoke_test.py` | 生命周期四态（load/config_update/unload）+ 组件清单（Command 1 / Tool 1 / HookHandler 2）与「组件名→方法名」配对；断言加载期不产生任何 LLM RPC |
+| `tests/test_review_llm_params.py` | 自评 LLM 参数纠偏 19 项：默认空配置零额外 RPC、`review_task` 透传、任务名误填 `review_model` 的自动纠偏与去重告警、Host 任务清单为空时不纠偏、真实模型名不动、**查询任务清单卡住时超时降级不阻塞自评**、首次即诊断、被拒参数停用（`model` / `task_name` 两侧）、无关错误不误伤、三击熔断仍生效、热重载重置自愈状态，以及**真机 config.toml 双填回归**（`review_model` 与 `review_task` 同为 `planner`：有任务清单时调用前丢 model；清单为空时失败一次即两侧停用回落默认）|
 
-增量 QA 覆盖：on_unload 在途任务回收、惰性清理四态（统计/冷却/消息记录/上下文缓存）、
-**提示注入分隔符中和**、配额滑动窗口过期、**通用入口软失败降级强类型入口**、
-**自评 LLM 超时保护**（Host RPC 无内建超时，卡住会让自评任务永久挂起）、
-平台消息 ID 两种键形态、自评撤回不误删更新的记录、静态扫描（无硬编码绝对路径/QQ 号/密钥）、
-**「未找到名为 xxx 的模型」熔断日志自诊断**（带出本次 model 参数值 + Host 可用模型任务名清单）。
+开发工作区另有历史大套件（`test_repeater_recall.py` 100 项、`..._extra.py` 47 项、`..._seg.py` 21 项），
+覆盖复读触发/冷却/分流、过滤规则、撤回四态、配额、自评三态、after_send 记录五态、历史兜底六态、
+manifest 能力声明与退避熔断九态、提示注入分隔符中和、分段聚合等。
 
-## 常见问题
+## 故障排查
 
 - **撤回报"没有可撤回的 bot 消息"（v1.0.2 已修复主因）**：v1.0.1 只记录插件自己发出的消息，Maisaka 主链路的日常回复拿不到 `platform_message_id`。v1.0.2 增加 `send_service.after_send` 全量记录 + 历史回溯兜底。若仍报该提示，请查日志：
   - 出现 `[诊断] after_send 未取到平台消息 ID：stream=... keys=[...]` → 说明该 Host 版本的 `after_send` 载荷回填时机晚于钩子，把 `keys=` 里的字段列表贴出来；此时可先依赖历史回溯兜底。
@@ -123,8 +122,15 @@ message_id / sent=False / 缺 ID / 非 bot / 登录信息不可用降级）、**
   `未获授权能力: api.call`。官方手册把 `api.call` 列为「免声明」，**实测 Host 1.2.3 仍会拒绝**——
   必须在 manifest 的 `capabilities` 里显式写上 `"api.call"`，改完**完整重启** MaiBot（热重载不生效）。
   v1.0.3 已补上，升级后若仍报此错，说明插件目录没换干净或没重启。
-- **自评报「未找到名为 'planner' 的模型」/「未找到名为 'utils' 的模型」（MaiBot 1.2.5 前后最常见，v1.2.2 起日志自带答案）**：
+- **自评报「未找到名为 'planner' 的模型」/「未找到名为 'utils' 的模型」（MaiBot 1.2.5 前后最常见，v1.2.3 起自动纠偏）**：
   **根因是「模型任务名」与「具体模型名」被混填，或者模型列表本身是空的。**
+
+  日志长这样（`[模型服务] [LLMService]` 与插件各一行，同一秒）：
+
+  ```text
+  09-16 12:29:33 [模型服务] [LLMService] 生成内容时出错: 未找到名为 'planner' 的模型
+  09-16 12:29:33 [plugin.org.mai-mai.repeater-recall] 自评 LLM 调用失败（第 1/3 次）：未找到名为 'planner' 的模型
+  ```
 
   MaiBot 1.2.5 的 changelog 写得很明确：
   > 插件 SDK/API：修复插件 LLM 能力把具体模型名误当作任务名解析的问题，支持分别指定模型任务与具体模型。
@@ -140,12 +146,27 @@ message_id / sent=False / 缺 ID / 非 bot / 登录信息不可用降级）、**
 
   | 日志里出现的名字 | 说明 | 处置 |
   |---|---|---|
-  | 只有 `'planner'` 之类**特定**任务名 | 把任务名填进了 `review_model`（那里只认具体模型名） | 把它挪到 `review_task`，或清空 `review_model` |
+  | 只有 `'planner'` 之类**特定**任务名 | 把任务名填进了 `review_model`（那里只认具体模型名）。真机最常见的形态是**双填**：`review_model = "planner"` 和 `review_task = "planner"` 同时存在 | 清空 `review_model`（任务名只填 `review_task`） |
   | **`'utils'` 也报找不到** | 模型层整体解析不到——`utils` 是 SDK 1.2.5 起的**默认任务名**，不是谁填的。几乎可以断定 **WebUI 里模型列表为空**（1.2.5 的 WebUI 1.7.4 正是在修「模型列表为空时无法添加提供商」这个坑） | 去 WebUI：**先保存提供商（provider），再添加模型**，最后把任务指到具体模型 |
 
-  辅助手段：熔断日志里会打出 `本次调用 review_task=... review_model=...` 与
-  `Host 当前可用模型任务名：...`（经 `llm.get_available_models`）；后者为空时插件会直接提示
-  「模型列表为空」。临时止血可把 `recall.self_review` 设为 `false`——撤回工具与 `/recall` 命令不受影响。
+  **v1.2.3 起插件自己会处理这类错误**，不再只能靠人工排查：
+
+  1. **调用前自动纠偏**：若 `review_model` 填的值既在内置任务名表（`utils`/`replyer`/`planner`/`vlm`/…）里，
+     又出现在 Host 返回的可用任务名清单里（`llm.get_available_models`，60 秒缓存，查询带 8 秒超时），
+     就在**发请求前丢掉这个 model 参数**——自评不中断，只打一条 WARNING 让你顺手改配置。
+     语义优先级：`review_task` 是显式指定的任务，**永远不会被 `review_model` 覆盖**；两项都填任务名时
+     只丢 model、保留 `review_task`。默认配置（两项都空）与填真实模型名的场景**不会产生任何额外 RPC**。
+  2. **首次失败即完整诊断**：不再等第 3 次熔断才给答案。第 1 次出现「未找到名为 X 的模型」就打 ERROR，
+     带出**本次实际传出的 `task_name` / `model`** 与 **Host 可用任务名清单**。
+  3. **停用被拒参数**：若被拒的名字正是本次传出的 `review_model`（或 `review_task`），
+     就在本会话内停用该参数、回落到默认任务，避免每条回复都白烧一次调用。
+     这**不改写** `config.toml`——改完配置热重载（或重启）即恢复使用新值。
+
+  > 若模型清单为空（`get_available_models` 返回 `[]`），插件无法确认名字性质，会保持原样先发一次；
+  > 该次失败后两个参数都会被停用、自评回落到默认任务。此时若日志转而报 **`未找到名为 'utils' 的模型`**，
+  > 说明是「模型列表为空」而非名字填错 —— 去 WebUI 先存提供商再加模型。
+
+  临时止血可把 `recall.self_review` 设为 `false`——撤回工具与 `/recall` 命令不受影响。
 - **自评每天狂刷 `qwen3.7-text-embedding ... Field required: input.contents`**：Host 没给本插件的 LLM
   任务（`plugin.org.mai-mai.repeater-recall`）配文本生成模型，fallback 到了向量模型。三选一：
   1. 在 `model_config.toml` 里给任务 `plugin.org.mai-mai.repeater-recall` 配一个文本模型（根治）；
@@ -172,3 +193,11 @@ message_id / sent=False / 缺 ID / 非 bot / 登录信息不可用降级）、**
 - **复读不触发**：确认文本长度 ≥ min_length、不是纯数字/超短英文单词、不在冷却期；`/命令` 消息不参与统计。
 - **自评从不撤回**：LLM 判定偏保守属正常设计（仅明显不合适才撤）；可调低 `review_delay_seconds` 观察 WebUI/日志中自评记录。
 - **命令提示"仅管理员可用"**：把触发者的 QQ 号加进 `recall.admin_ids`（WebUI 插件配置或 config.toml 均可，热重载生效），格式 `["123456789"]` 或 `["qq:123456789"]`；本地控制台始终可用。
+
+## 版本记录
+
+| 版本 | 变更 |
+|---|---|
+| **1.2.3** | 自评 LLM 参数自愈：`review_model` 误填任务名时**调用前自动丢弃该参数**（`review_task` 已显式指定时保留它，不被覆盖）；「未找到名为 X 的模型」**首次出现即完整诊断**（带实际传出参数 + Host 可用任务名清单）并**在本会话内停用被拒参数**；启动/热重载日志回显 `review_task` / `review_model`；补 `tests/`（FakeHost 冒烟 + 参数纠偏 19 项，含真机配置回归） |
+| 1.2.2 | 「未找到名为 xxx 的模型」熔断日志自诊断（附带本次参数值 + 可用任务名清单） |
+| 1.2.0 | 分段感知：出站消息按 `group_window_seconds` 聚合为一条逻辑回复，整组记录 / 整组撤回 / 聚合自评一次 |
