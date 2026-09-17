@@ -16,6 +16,9 @@
    recall.review_model 会稳定报「未找到名为 'planner' 的模型」。插件在调用前
    用 Host 的可用任务名清单纠偏（改按 task_name 调用），调用后首次失败即给出
    完整诊断，并在本会话内停用被拒参数，避免每条回复都白烧一次 LLM 调用。
+5. 当天复读去重（v1.3.0）：同一天内已经复读过的句子不再复读，跨天（本地时区
+   0 点）惰性重置；记录落盘到插件 data 目录，MaiBot 重启后当天记忆不丢。
+   去重范围可配：默认按聊天流隔离（各群互不影响），也可设为全流共享。
 
 撤回通过 napcat-adapter 的 adapter.napcat.action.call(action_name="delete_msg")
 实现，兼容负 message_id；适配器不可用时复读功能不受影响，撤回报可读错误。
@@ -26,6 +29,7 @@ import json
 import re
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
@@ -124,6 +128,14 @@ _SEG_KEEP = 12  # 单条回复记录的最大分段数（对齐智能分段插�
 # 超过窗口仍来的出站消息视为独立回复而非同一条的新分段
 _SEG_GROUP_JITTER_SECONDS = 2.0
 
+# 当天复读去重（v1.3.0）：
+# 记录键用**归一化后的文本本身**，而不是 hash(text)——Python 字符串 hash 带随机盐
+# （PYTHONHASHSEED），跨进程不一致，落盘后重启会全部失配，等于没记。
+# （_recent 里的 hash 只在本进程内比较，不受此影响。）
+_SAME_DAY_MAX = 5000  # 单日记录上限，超出丢弃最旧的，防极端刷屏撑内存
+_SAME_DAY_FILE = "repeat_same_day.json"  # 落在 ctx.paths.data_dir 下，跨重启保留
+_SAME_DAY_SCOPE_GLOBAL = "global"  # same_day_scope 取该值时全流共享同一份去重记录
+
 
 class PluginSectionConfig(PluginConfigBase):
     """插件基础配置。"""
@@ -152,6 +164,16 @@ class RepeatSectionConfig(PluginConfigBase):
         default=True,
         description="是否要求接龙的都是不同用户：开启后同一个人连刷同一句不触发跟读，"
         "必须连续 N 条来自 N 个不同用户才跟读；关闭则退化为旧行为（只看文本连续重复）",
+    )
+    skip_same_day_repeat: bool = Field(
+        default=True,
+        description="当天已经复读过的句子不再复读（以本地时区 0 点为界跨天重置）；"
+        "记录落盘在插件数据目录，重启 MaiBot 后当天记忆不丢",
+    )
+    same_day_scope: str = Field(
+        default="stream",
+        description="当天去重范围：stream = 仅当前聊天流（默认，每个群各记各的）；"
+        "global = 所有聊天流共享，同一句当天全局只复读一次",
     )
 
 
@@ -266,6 +288,11 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         # 聚合自评排程表：stream_id -> {"group": 分组引用, "task": 聚合自评任务}
         # 同一分组只允许一个等待中的自评任务，后续分段到达不重复 spawn（v1.2.0）
         self._pending_review: dict[str, dict[str, Any]] = {}
+        # 当天复读去重（v1.3.0）：key -> 记录时刻；_same_day_date 为这批记录所属日期
+        # （惰性跨天重置：读写前比对当天日期，不一致即清空，不依赖常驻定时任务）
+        self._same_day: dict[str, float] = {}
+        self._same_day_date: str = ""
+        self._same_day_warned: bool = False  # 落盘失败只告警一次，防刷屏
         cfg = self.config
         self.ctx.logger.info(
             "复读机与自主撤回已加载（复读=%s 阈值=%s 冷却=%ss；撤回=%s 自评=%s）",
@@ -284,6 +311,14 @@ class RepeaterRecallPlugin(MaiBotPlugin):
                 cfg.recall.review_task,
                 cfg.recall.review_model,
             )
+        # 当天复读记录：从 data 目录恢复（隔天/损坏的文件一律忽略，等价于空记录）
+        self._load_same_day()
+        self.ctx.logger.info(
+            "当天复读去重：%s（scope=%s，当前记录 %d 条；以本地 0 点为界重置）",
+            "开启" if cfg.repeat.skip_same_day_repeat else "关闭",
+            self._same_day_scope_name(),
+            len(self._same_day),
+        )
 
     async def on_unload(self) -> None:
         """插件卸载时执行。"""
@@ -301,6 +336,9 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         cfg = self.config
         # 阈值变化时重建各聊天流的统计队列
         self._recent.clear()
+        # 当天去重记录**不**随热重载清空：scope 从 stream 改成 global 时键形态不同，
+        # 旧记录自然失配（不会误判），而清空会让一次热重载白丢当天记忆。
+        self._same_day_warned = False
         # 清掉上一版 LLM 参数的自愈状态与缓存：让「改完 review_task / review_model」立即生效，
         # 而不是继续沿用上一版被判无效而停用的参数（否则用户改完配置仍看不到变化）
         self._review_model_disabled = False
@@ -364,6 +402,8 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             task = pending.get("task")
             if task is None or task.done():
                 self._pending_review.pop(sid, None)
+        # 当天记录顺带跨天重置（读写路径各自另有日期校验，这里只是让空闲流也跟上）
+        self._roll_same_day()
 
     async def _ensure_bot_ids(self) -> set:
         """获取并缓存 bot 自身 user_id（get_login_info，陷阱篇：不要反查历史消息取机器人昵称）。
@@ -1079,6 +1119,141 @@ class RepeaterRecallPlugin(MaiBotPlugin):
         return False, "没有可撤回的 bot 消息"
 
     # ------------------------------------------------------------------
+    # 当天复读去重（v1.3.0）
+    # ------------------------------------------------------------------
+
+    def _same_day_enabled(self) -> bool:
+        """当天去重是否生效（关闭时既不判定也不记录，行为回到 v1.2.x）。"""
+        return bool(getattr(self.config.repeat, "skip_same_day_repeat", True))
+
+    @staticmethod
+    def _today_str() -> str:
+        """本地时区当天日期（YYYY-MM-DD）——跨天即以 0 点为界重置。"""
+        return time.strftime("%Y-%m-%d")
+
+    def _same_day_scope_name(self) -> str:
+        """归一化去重范围：只认 global，其余一律按 stream（配置写错也不至于全群静音）。"""
+        scope = str(getattr(self.config.repeat, "same_day_scope", "stream") or "").strip().lower()
+        return _SAME_DAY_SCOPE_GLOBAL if scope == _SAME_DAY_SCOPE_GLOBAL else "stream"
+
+    def _same_day_key(self, stream_id: str, text_norm: str) -> str:
+        """当天记录键。
+
+        global 范围直接用文本当键（跨流共享）；默认在文本前拼 stream_id。
+        用 \\x1f（单元分隔符）拼接而非冒号/竖线：正常消息文本与会话 ID 里都不会出现它，
+        避免「文本里带分隔符」造成的键歧义（如 sid="a" 文本="b:c" 与 sid="a:b" 文本="c"）。
+        文本截断到 _TEXT_KEEP，与出站记录保持同一上限，防超长文本把单日记录撑爆。
+        """
+        text_key = text_norm[:_TEXT_KEEP]
+        if self._same_day_scope_name() == _SAME_DAY_SCOPE_GLOBAL:
+            return text_key
+        return f"{stream_id}\x1f{text_key}"
+
+    def _roll_same_day(self) -> None:
+        """惰性跨天重置：日期一变就清空记录（不引入常驻定时任务）。"""
+        today = self._today_str()
+        if self._same_day_date == today:
+            return
+        old = self._same_day_date or "（无）"
+        if self._same_day:
+            self.ctx.logger.info(
+                "跨天重置当天复读记录（%s → %s，清空 %d 条）", old, today, len(self._same_day)
+            )
+        self._same_day.clear()
+        self._same_day_date = today
+        self._same_day_warned = False
+
+    def _same_day_seen(self, stream_id: str, text_norm: str) -> bool:
+        """该句今天是否已经复读过了。"""
+        if not self._same_day_enabled():
+            return False
+        self._roll_same_day()
+        return self._same_day_key(stream_id, text_norm) in self._same_day
+
+    def _same_day_remember(self, stream_id: str, text_norm: str) -> None:
+        """记下「今天复读过这句」——只在跟读**发送成功后**调用。
+
+        若发送前就记账，一次发送失败会让该句当天彻底失去复读资格；
+        代价只是 global 范围下不同流同时触发时存在极小概率的漏网（同一群内
+        有冷却 + 链条清空兜底，不会发生）。
+        """
+        self._roll_same_day()
+        self._same_day[self._same_day_key(stream_id, text_norm)] = time.time()
+        if len(self._same_day) > _SAME_DAY_MAX:
+            # 超出上限丢最旧：按记录时刻保留最新 _SAME_DAY_MAX 条
+            keep = sorted(self._same_day.items(), key=lambda kv: kv[1])[-_SAME_DAY_MAX:]
+            self._same_day = dict(keep)
+
+    def _same_day_store_path(self) -> Path | None:
+        """当天记录落盘路径（ctx.paths.data_dir，SDK 2.6.0+）；取不到返回 None。"""
+        paths = getattr(self.ctx, "paths", None)
+        data_dir = getattr(paths, "data_dir", None)
+        if data_dir in (None, ""):
+            return None
+        try:
+            return Path(data_dir) / _SAME_DAY_FILE
+        except Exception:  # pragma: no cover - 路径形态异常
+            return None
+
+    def _load_same_day(self) -> None:
+        """启动时恢复当天记录。
+
+        隔天文件、坏 JSON、结构不符一律按「空记录」继续——去重是锦上添花，
+        绝不允许它把插件加载流程带崩。
+        """
+        self._roll_same_day()  # 先确定 _same_day_date＝今天，才能判断文件是否属于当天
+        path = self._same_day_store_path()
+        if path is None:
+            self.ctx.logger.info(
+                "未取到 ctx.paths.data_dir（SDK < 2.6.0？）：当天复读记录仅存内存，重启后重置"
+            )
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            self.ctx.logger.warning("当天复读记录读取失败，按空记录继续：%s", exc)
+            return
+        if not isinstance(raw, dict) or str(raw.get("date") or "") != self._same_day_date:
+            return  # 隔天（或格式不符）的文件不恢复
+        entries = raw.get("entries")
+        if not isinstance(entries, dict):
+            return
+        for key, ts in entries.items():
+            try:
+                self._same_day[str(key)] = float(ts)
+            except (TypeError, ValueError):
+                continue  # 单条脏数据跳过，不拖垮整份记录
+        if len(self._same_day) > _SAME_DAY_MAX:
+            keep = sorted(self._same_day.items(), key=lambda kv: kv[1])[-_SAME_DAY_MAX:]
+            self._same_day = dict(keep)
+
+    def _save_same_day(self) -> None:
+        """落盘当天记录（同步函数，调用方放进 to_thread，避免阻塞事件循环）。
+
+        先写临时文件再原子替换：写到一半被打断也不会留下半截 JSON。
+        失败只告警一次——落盘失败仅意味着重启后丢记录，复读主流程不受影响。
+        """
+        path = self._same_day_store_path()
+        if path is None:
+            return
+        payload = {
+            "date": self._same_day_date or self._today_str(),
+            "scope": self._same_day_scope_name(),
+            "entries": self._same_day,
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.{time.time_ns()}.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as exc:
+            if not self._same_day_warned:
+                self._same_day_warned = True
+                self.ctx.logger.warning("当天复读记录落盘失败（不再重复告警）：%s", exc)
+
+    # ------------------------------------------------------------------
     # 组件
     # ------------------------------------------------------------------
 
@@ -1109,8 +1284,18 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             sender_id = f"__unknown_{self._unknown_sender_seq}"
         if not self._check_repeat(stream_id, normalized, sender_id):
             return {"action": "continue"}
+        # 当天已复读过的句子不再复读（v1.3.0）：
+        # 清空链条让计数重新开始，且**不**进冷却——没真正跟读就不该占用其他句子的复读机会。
+        if self._same_day_seen(stream_id, normalized):
+            bucket = self._recent.get(stream_id)
+            if bucket:
+                bucket.clear()
+            self.ctx.logger.info(
+                "该句当天已复读过，跳过跟读（stream=%s）：%.30s", stream_id, text
+            )
+            return {"action": "continue"}
         self._mark_cooldown(stream_id)
-        self._spawn(self._repeat_send(stream_id, text))
+        self._spawn(self._repeat_send(stream_id, text, normalized))
         return {"action": "continue"}
 
     @HookHandler("send_service.after_send", name="repeater_track_outgoing", mode=_HOOK_MODE_OBSERVE)
@@ -1157,12 +1342,22 @@ class RepeaterRecallPlugin(MaiBotPlugin):
             self._ensure_group_review(stream_id)
         return {"action": "continue"}
 
-    async def _repeat_send(self, stream_id: str, text: str) -> None:
-        """跟读发送（后台任务，不阻塞消息流）。"""
+    async def _repeat_send(self, stream_id: str, text: str, text_norm: str = "") -> None:
+        """跟读发送（后台任务，不阻塞消息流）。
+
+        发送**成功**才把该句记进当天去重表：发送失败不该让一句今天失去复读资格。
+        落盘放进 to_thread 以免阻塞事件循环；落盘失败只影响重启后的记忆，不影响本次跟读。
+        """
         try:
             sent, _msg = await self._send_and_track(stream_id, text)
             if sent:
                 self.ctx.logger.info("已跟读复读消息（stream=%s）：%.50s", stream_id, text)
+                if text_norm and self._same_day_enabled():
+                    self._same_day_remember(stream_id, text_norm)
+                    try:
+                        await asyncio.to_thread(self._save_same_day)
+                    except Exception as exc:  # pragma: no cover - to_thread 层面的兜底
+                        self.ctx.logger.warning("当天复读记录落盘异常：%s", exc)
         except Exception as exc:
             self.ctx.logger.error("复读发送失败：%s", exc, exc_info=True)
 
