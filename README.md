@@ -36,14 +36,14 @@ MaiBot 插件：经典复读机 + LLM 自主撤回。
 - MaiBot Host >= 1.2.0，maibot-plugin-sdk >= 2.5.0
 - 当天复读记录的**落盘**能力依赖 SDK 2.6.0+（`ctx.paths.data_dir`）；SDK 更旧时插件照常工作，
   只是当天记录仅存内存、重启即清零（`on_load` 日志会提示「未取到 ctx.paths.data_dir」）。
-- **撤回功能硬依赖 `maibot-team.napcat-adapter` >= 1.4.0**（manifest 已声明 plugin 依赖，Host 会保证启动顺序）。适配器缺失时撤回操作报"适配器不可用"，复读功能不受影响。
+- **撤回功能硬依赖 `maibot-team.snowluma-adapter` >= 1.0.0**（v1.3.0 起 SnowLuma 连接器合并 NapCat 适配器，`adapter.napcat.*` API 前缀保持不变；manifest 已声明 plugin 依赖，Host 会保证启动顺序）。适配器缺失时撤回操作报"适配器不可用"，复读功能不受影响。
 
 ## 安装与启用
 
 1. 将 `repeater-recall/` 目录放入 MaiBot 的 `plugins/` 下。
 2. 重启 MaiBot（manifest 含 capabilities 与插件依赖声明，必须完整重启，热重载不生效）。
 3. WebUI → 插件管理中确认「复读机与自主撤回」已启用。
-4. 确保 NapCat 已登录且 napcat-adapter 连接正常。
+4. 确保 NapCat 已登录且 snowluma-adapter 连接正常。
 5. 在 WebUI 插件配置中把你的 QQ 号填入 `recall.admin_ids`（如 `["123456789"]`），否则 `/recall` 命令只有本地控制台能用。
 
 ## 配置项（config.toml，由 Runner 自动生成）
@@ -200,7 +200,7 @@ manifest 能力声明与退避熔断九态、提示注入分隔符中和、分�
   - 分段插件用小模型（`gpt-4o-mini` / `qwen-plus` 一类）即可，与本插件的自评模型互不影响；
   - 若分段后自评出现「一条回复评了多次」，说明分段间隔超过了 `group_window_seconds`，调大该值
     （上限 30 秒）即可；反之若两条独立回复被误并成一组一起撤回，调小该值。
-- **撤回报"适配器不可用"**：检查 napcat-adapter 是否加载、NapCat 是否在线；`ctx.api.call` 报「API 不存在」通常是适配器未装或版本 < 1.4.0。
+- **撤回报"适配器不可用"**：检查 snowluma-adapter（合并版）是否加载、NapCat 是否在线；`ctx.api.call` 报「API 不存在」通常是适配器未装。
 - **撤回报超时限**：QQ 平台限制约 2 分钟，插件按 120 秒保守截断。
 - **复读不触发**：确认文本长度 ≥ min_length、不是纯数字/超短英文单词、不在冷却期；`/命令` 消息不参与统计。
   若**只有某些句子**不触发，先看日志里有没有「该句当天已复读过，跳过跟读」——这是 v1.3.0 的当天去重生效
